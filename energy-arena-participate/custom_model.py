@@ -48,13 +48,20 @@ def transform_payload(
         return payload
 
     matrix = np.array(historical_data)
-    mean_forecast = np.maximum(np.mean(matrix, axis=0), 0)
+    mean_forecast = np.maximum(np.mean(matrix, axis=0), 0.0)
+    std_per_step  = np.std(matrix, axis=0)
+
+    # Nachtstunden: Zeitschritte unter 1 % des Tagespeaks → Mean und Std auf 0
+    peak = float(mean_forecast.max()) if mean_forecast.max() > 0 else 1.0
+    night_mask = mean_forecast < 0.01 * peak
+    mean_forecast[night_mask] = 0.0
+    std_per_step[night_mask]  = 0.0
 
     print(f"[✓] Forecast aus {len(historical_data)} Tagen. Erste 5: {mean_forecast[:5]}")
 
     for index, original_value in enumerate(payload["values"]):
         forecast_value = float(mean_forecast[index]) if index < len(mean_forecast) else 0.0
-        std = float(np.std(matrix[:, index])) if index < matrix.shape[1] else 1.0
+        std = float(std_per_step[index]) if index < len(std_per_step) else 1.0
 
         if isinstance(original_value, (int, float)):
             payload["values"][index] = forecast_value
