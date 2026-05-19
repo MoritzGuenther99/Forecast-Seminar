@@ -1,8 +1,3 @@
-"""
-Eigenes Solar Forecast Modell fuer DE_LU.
-Strategie: Durchschnitt der letzten 7 Tage pro Stunde als Forecast.
-"""
-
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta
