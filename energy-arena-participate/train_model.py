@@ -17,6 +17,10 @@ Outputs saved to ./model_artifacts/:
     feature_names.json          – ordered feature list
     training_stats.json         – RMSE per CV fold, run metadata
     validation_plot.png         – last-30-days actual vs predicted
+    feature_importance_plot.png – top-30 LightGBM feature importances
+    cluster_map.png             – cluster centroids on Germany lat/lon map
+    shap_summary.png            – SHAP beeswarm (last 30 days)
+    shap_bar.png                – mean |SHAP| bar chart (last 30 days)
 
 References:
     Nespoli et al. 2019:       150 W/m² daily mean GHI → sunny/cloudy threshold
@@ -29,6 +33,7 @@ import json
 import shutil
 import tempfile
 import time
+import xml.etree.ElementTree as ET
 import zipfile
 from datetime import date, timedelta
 from pathlib import Path
@@ -41,6 +46,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import requests
+import shap
 from sklearn.cluster import KMeans
 from sklearn.metrics import mean_squared_error
 from sklearn.model_selection import TimeSeriesSplit
@@ -101,113 +107,73 @@ def _download_zip(url: str, save_path: Path) -> None:
     print(f"[MaStR] Download complete: {save_path.stat().st_size / 1e6:.0f} MB")
 
 
-def _load_solar_csv(path: Path) -> pd.DataFrame | None:
+def _load_solar_xml(path: Path) -> pd.DataFrame | None:
     """
-    Parse one MaStR solar CSV file.
+    Parse one MaStR EinheitenSolar_*.xml file (UTF-16, iterative streaming).
 
-    Handles the common MaStR export format (semicolon-separated, decimal comma)
-    with multiple encoding fallbacks.  Returns a tidy DataFrame with columns
-    [lat, lon, kw, land?] or None on failure.
+    Records are <EinheitSolar> elements. Operational status is the numeric
+    field EinheitBetriebsstatus == "35" (= InBetrieb). Not every record has
+    coordinates; those without are skipped via dropna.
+    Returns a tidy DataFrame with columns [lat, lon, kw, land] or None on failure.
     """
-    # Columns we need (patterns matched case-insensitively after stripping soft hyphens)
-    COL_PATTERNS: dict[str, list[str]] = {
-        "lat":    ["breitengrad"],
-        "lon":    ["längengrad", "laengengrad"],
-        "kw":     ["nettonennleistung"],
-        "status": ["betriebsstatus"],
-        "land":   ["bundesland"],
-    }
+    rows: list[dict] = []
 
-    detected_enc = detected_sep = detected_dec = None
-    col_map: dict[str, str] = {}
-
-    for enc in ("utf-8-sig", "utf-8", "cp1252", "latin1"):
-        for sep, dec in ((";", ","), (";", "."), (",", ".")):
-            try:
-                hdr_df = pd.read_csv(
-                    path, sep=sep, decimal=dec, encoding=enc, nrows=0, low_memory=False
-                )
-                if len(hdr_df.columns) < 5:
-                    continue  # wrong separator
-
-                # Normalise header: strip soft hyphens (U+00AD), quotes, whitespace
-                norm_to_orig = {
-                    c.replace("­", "").strip().strip('"').lower(): c
-                    for c in hdr_df.columns
-                }
-
-                tmp_map: dict[str, str] = {}
-                for key, patterns in COL_PATTERNS.items():
-                    for pat in patterns:
-                        if pat in norm_to_orig:
-                            tmp_map[key] = norm_to_orig[pat]
-                            break
-
-                if "lat" in tmp_map and "lon" in tmp_map and "kw" in tmp_map:
-                    detected_enc, detected_sep, detected_dec = enc, sep, dec
-                    col_map = tmp_map
-                    break
-            except Exception:
-                continue
-        if detected_enc:
-            break
-
-    if not detected_enc:
-        print(f"  [!] Could not detect CSV format for {path.name}")
-        return None
-
-    # Read only the needed columns
-    usecols = list(set(col_map.values()))
     try:
-        df = pd.read_csv(
-            path,
-            sep=detected_sep,
-            decimal=detected_dec,
-            encoding=detected_enc,
-            usecols=usecols,
-            low_memory=False,
-        )
+        # ET.iterparse detects the UTF-16 BOM automatically from the binary stream
+        for _event, elem in ET.iterparse(path, events=("end",)):
+            if elem.tag != "EinheitSolar":
+                continue
+
+            # 35 = InBetrieb (numeric catalogue value)
+            if (elem.findtext("EinheitBetriebsstatus") or "").strip() != "35":
+                elem.clear()
+                continue
+
+            def _f(tag: str) -> str:
+                return (elem.findtext(tag) or "").strip().replace(",", ".")
+
+            rows.append({
+                "lat":  _f("Breitengrad"),
+                "lon":  _f("Laengengrad"),
+                "kw":   _f("Nettonennleistung"),
+                "land": (elem.findtext("Bundesland") or "").strip(),
+            })
+            elem.clear()
+    except ET.ParseError as exc:
+        print(f"  [!] XML parse error in {path.name}: {exc}")
+        return None
     except Exception as exc:
-        print(f"  [!] Read failed for {path.name}: {exc}")
+        print(f"  [!] Failed reading {path.name}: {exc}")
         return None
 
-    df = df.rename(columns={v: k for k, v in col_map.items()})
+    if not rows:
+        return None
 
-    # Filter operational plants
-    if "status" in df.columns:
-        df = df[df["status"].astype(str).str.strip() == "In Betrieb"].copy()
-
-    # Parse lat/lon/kw to float (handles any remaining decimal-comma strings)
+    df = pd.DataFrame(rows)
     for col in ("lat", "lon", "kw"):
-        df[col] = pd.to_numeric(
-            df[col].astype(str).str.strip().str.replace(",", ".", regex=False),
-            errors="coerce",
-        )
+        df[col] = pd.to_numeric(df[col], errors="coerce")
 
     df = df.dropna(subset=["lat", "lon", "kw"])
     df = df[df["kw"] > 0].copy()
-
-    out_cols = ["lat", "lon", "kw"] + (["land"] if "land" in df.columns else [])
-    return df[out_cols].reset_index(drop=True)
+    return df[["lat", "lon", "kw", "land"]].reset_index(drop=True)
 
 
 def _parse_mastr_from_zip(zip_path: Path) -> pd.DataFrame:
-    """Extract *EinheitenSolar*.csv file(s) from ZIP and parse them."""
+    """Extract EinheitenSolar_*.xml file(s) from ZIP and parse them."""
     with zipfile.ZipFile(zip_path) as zf:
         solar_files = sorted(
             n for n in zf.namelist()
-            if "EinheitenSolar" in n and n.endswith(".csv")
+            if "EinheitenSolar" in n and n.endswith(".xml")
         )
 
     if not solar_files:
-        # Show first few entries to help debug
         with zipfile.ZipFile(zip_path) as zf:
             names = zf.namelist()
         raise RuntimeError(
-            f"No *EinheitenSolar*.csv found in ZIP. First 20 entries: {names[:20]}"
+            f"No EinheitenSolar_*.xml found in ZIP. First 20 entries: {names[:20]}"
         )
 
-    print(f"[MaStR] Solar CSV(s) in ZIP: {solar_files}")
+    print(f"[MaStR] EinheitenSolar XML parts: {len(solar_files)} files")
 
     tmp_dir = Path(tempfile.mkdtemp(prefix="mastr_"))
     try:
@@ -217,7 +183,7 @@ def _parse_mastr_from_zip(zip_path: Path) -> pd.DataFrame:
                 extracted = Path(zf.extract(fname, path=tmp_dir))
                 size_mb   = extracted.stat().st_size / 1e6
                 print(f"  Parsing {fname}  ({size_mb:.0f} MB extracted) …")
-                df_part = _load_solar_csv(extracted)
+                df_part = _load_solar_xml(extracted)
                 if df_part is not None and len(df_part) > 0:
                     print(f"    → {len(df_part):,} valid plants")
                     all_dfs.append(df_part)
@@ -389,8 +355,9 @@ def fetch_open_meteo_archive(
         index=pd.to_datetime(h["time"]),
     )
     df.index = df.index.tz_localize(
-        "Europe/Berlin", ambiguous="infer", nonexistent="shift_forward"
+        "Europe/Berlin", ambiguous="NaT", nonexistent="shift_forward"
     )
+    df = df[df.index.notna()]
     df["temp"]  = df["temp"].ffill().fillna(10.0)
     df["cloud"] = df["cloud"].ffill().fillna(50.0)
     df["wind"]  = df["wind"].ffill().fillna(3.0)
@@ -762,6 +729,98 @@ def main() -> None:
     fig.savefig(ARTIFACT_DIR / "validation_plot.png", dpi=130)
     plt.close(fig)
     print(f"[✓] Validation plot saved  (RMSE {rmse_p:.1f} MW)")
+
+    # ------------------------------------------------------------------
+    # 11. Feature importance plot – top 30 features
+    # ------------------------------------------------------------------
+    imps_all  = model_point.feature_importances_
+    top30_idx = np.argsort(imps_all)[::-1][:30]
+    top30_names = [feature_names[i] for i in top30_idx]
+    top30_vals  = imps_all[top30_idx]
+
+    fig, ax = plt.subplots(figsize=(10, 8))
+    y_pos = np.arange(len(top30_names))
+    ax.barh(y_pos, top30_vals[::-1], align="center")
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels(top30_names[::-1], fontsize=8)
+    ax.set_xlabel("Feature Importance (LightGBM splits)")
+    ax.set_title("Top 30 Feature Importances – Point Model")
+    ax.grid(axis="x", alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(ARTIFACT_DIR / "feature_importance_plot.png", dpi=130)
+    plt.close(fig)
+    print("[✓] feature_importance_plot.png saved")
+
+    # ------------------------------------------------------------------
+    # 12. Cluster map – centroids on Germany bounding box
+    # ------------------------------------------------------------------
+    cap_gws   = np.array([c["capacity_gw"] for c in clusters])
+    dot_sizes = 50 + 750 * (cap_gws / cap_gws.max())
+
+    fig, ax = plt.subplots(figsize=(6, 8))
+    ax.set_xlim(6, 15)
+    ax.set_ylim(47, 55)
+    ax.set_xlabel("Longitude (°E)")
+    ax.set_ylabel("Latitude (°N)")
+    ax.set_title("PV Cluster Centroids – Capacity-Weighted K-Means")
+    ax.set_facecolor("#dce9f5")
+    ax.grid(alpha=0.4, linestyle="--")
+
+    ax.scatter(
+        [c["lon"] for c in clusters],
+        [c["lat"] for c in clusters],
+        s=dot_sizes,
+        c=np.arange(len(clusters)),
+        cmap="tab10",
+        alpha=0.85,
+        edgecolors="k",
+        linewidths=0.5,
+        zorder=3,
+    )
+    for i, c in enumerate(clusters):
+        ax.annotate(
+            f"C{i}\n{c['capacity_gw']:.1f} GW",
+            xy=(c["lon"], c["lat"]),
+            xytext=(5, 5),
+            textcoords="offset points",
+            fontsize=7,
+            zorder=4,
+        )
+    fig.tight_layout()
+    fig.savefig(ARTIFACT_DIR / "cluster_map.png", dpi=130)
+    plt.close(fig)
+    print("[✓] cluster_map.png saved")
+
+    # ------------------------------------------------------------------
+    # 13. SHAP analysis – point model on last 30 days of test data
+    # ------------------------------------------------------------------
+    X_shap      = X[pm]
+    explainer   = shap.TreeExplainer(model_point)
+    shap_values = explainer.shap_values(X_shap)
+
+    shap.summary_plot(
+        shap_values, X_shap,
+        feature_names=feature_names,
+        max_display=20,
+        show=False,
+    )
+    plt.tight_layout()
+    plt.savefig(ARTIFACT_DIR / "shap_summary.png", dpi=130, bbox_inches="tight")
+    plt.close()
+    print("[✓] shap_summary.png saved")
+
+    shap.summary_plot(
+        shap_values, X_shap,
+        feature_names=feature_names,
+        plot_type="bar",
+        max_display=20,
+        show=False,
+    )
+    plt.tight_layout()
+    plt.savefig(ARTIFACT_DIR / "shap_bar.png", dpi=130, bbox_inches="tight")
+    plt.close()
+    print("[✓] shap_bar.png saved")
+
     print("Done.")
 
 
