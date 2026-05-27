@@ -7,9 +7,12 @@ created by train_model.py using capacity-weighted K-Means on MaStR data.
 Models are loaded once on the first call and cached at module level.
 
 References:
-    Nespoli et al. 2019:       150 W/m² daily mean GHI → sunny/cloudy threshold
-    Terren-Serrano et al. 2026: NWP (ICON/GFS) forecast at inference time;
-                                capacity-density spatial masking for site selection
+    Nespoli et al. 2019:        150 W/m² daily mean GHI → sunny/cloudy threshold
+    Sperati et al. 2016:        ECMWF ensemble for probabilistic PV forecasting
+    Terren-Serrano et al. 2026: NWP + ensemble weather forecasts for probabilistic
+                                energy forecasting; capacity-density spatial masking
+    Yu et al. 2026:             PhysEmbedFormer: physics-guided decomposition
+                                P_ac = P_physics + P_residual (eq. 6 for G_eff)
 """
 from __future__ import annotations
 
@@ -32,11 +35,21 @@ _MODEL_Q10      = None
 _MODEL_Q90      = None
 _FEATURE_NAMES: list[str]  = []
 _CLUSTERS:      list[dict] = []   # loaded from clusters.json
+_ENSEMBLE_CACHE: dict      = {}   # target_date → {loc_name: {member_id: pd.DataFrame}}
+_PHYSICS_DECOMP: bool      = False  # True when loaded model includes p_physics feature
 
 _ARTIFACT_DIR = Path(__file__).resolve().parent / "model_artifacts"
 
 # Nespoli et al. 2019, §2.3
 _SUNNY_THRESHOLD = 150.0  # W/m²
+
+# Yu et al. 2026: PV panel physics parameters (eq. 6)
+_TILT_RAD = np.radians(20.0)                              # typical German rooftop
+_K_DIFF   = 0.5 * (1.0 + np.cos(_TILT_RAD))              # diffuse view factor ≈ 0.970
+_RHO_G    = 0.2                                           # ground reflectance
+_K_REFL   = 0.5 * _RHO_G * (1.0 - np.cos(_TILT_RAD))    # reflected component ≈ 0.006
+_GAMMA    = -0.004                                        # temperature coefficient /°C
+_ETA      = 0.96                                          # inverter efficiency
 
 
 # ---------------------------------------------------------------------------
@@ -50,7 +63,7 @@ def _load_models() -> bool:
     so transform_payload can fall back to the baseline payload.
     """
     global _MODELS_LOADED, _MODEL_POINT, _MODEL_Q10, _MODEL_Q90
-    global _FEATURE_NAMES, _CLUSTERS
+    global _FEATURE_NAMES, _CLUSTERS, _PHYSICS_DECOMP
 
     if _MODELS_LOADED:
         return True
@@ -67,11 +80,17 @@ def _load_models() -> bool:
         _CLUSTERS = json.loads(
             (_ARTIFACT_DIR / "clusters.json").read_text(encoding="utf-8")
         )
-        _MODELS_LOADED = True
+        _PHYSICS_DECOMP = "p_physics" in _FEATURE_NAMES
+        _MODELS_LOADED  = True
         print(
             f"[custom_model_3] Loaded {len(_CLUSTERS)} clusters, "
             f"{len(_FEATURE_NAMES)} features  ←  {_ARTIFACT_DIR}"
         )
+        if not _PHYSICS_DECOMP:
+            print(
+                "[custom_model_3] WARNING: models lack 'p_physics' feature. "
+                "Run python train_model.py to retrain with physics decomposition."
+            )
         return True
 
     except Exception as exc:
@@ -141,6 +160,85 @@ def _fetch_open_meteo_forecast(
 
 
 # ---------------------------------------------------------------------------
+# ECMWF IFS ensemble fetch via Open-Meteo ensemble API
+# Sperati et al. 2016: ECMWF ensemble members for probabilistic PV forecasting.
+# Terren-Serrano et al. 2026: ensemble weather forecasts for probabilistic
+#                             energy forecasting.
+# ---------------------------------------------------------------------------
+
+def _fetch_open_meteo_ensemble(
+    lat: float,
+    lon: float,
+    *,
+    past_days: int = 9,
+) -> dict[str, pd.DataFrame]:
+    """
+    Fetch ECMWF IFS025 ensemble from the Open-Meteo ensemble API.
+    Returns {member_id: pd.DataFrame} with 50 members (member01 … member50),
+    each DataFrame having the same column structure as _fetch_open_meteo_forecast.
+    If a variable carries no per-member field, the ensemble-mean field is used
+    for all 50 members.
+    """
+    url = "https://ensemble-api.open-meteo.com/v1/ensemble"
+    params = {
+        "latitude":      lat,
+        "longitude":     lon,
+        "hourly":        (
+            "shortwave_radiation,temperature_2m,cloudcover,"
+            "diffuse_radiation,precipitation,windspeed_10m"
+        ),
+        "models":        "ecmwf_ifs025",
+        "forecast_days": 2,
+        "past_days":     past_days,
+        "timezone":      "Europe/Berlin",
+    }
+    resp = requests.get(url, params=params, timeout=30)
+    resp.raise_for_status()
+    h     = resp.json()["hourly"]
+    times = pd.to_datetime(h["time"])
+
+    def _c(vals: list, fb: float = 0.0) -> list:
+        return [v if v is not None else fb for v in vals]
+
+    # (api_field_prefix, df_column, none_fallback)
+    _VARS = [
+        ("shortwave_radiation", "ghi",    0.0),
+        ("temperature_2m",      "temp",   float("nan")),
+        ("cloudcover",          "cloud",  float("nan")),
+        ("diffuse_radiation",   "dhi",    0.0),
+        ("precipitation",       "precip", 0.0),
+        ("windspeed_10m",       "wind",   float("nan")),
+    ]
+    n = len(times)
+
+    members: dict[str, pd.DataFrame] = {}
+    for mid in range(1, 51):
+        mkey = f"member{mid:02d}"
+        data: dict[str, list] = {}
+        for api_var, col, fb in _VARS:
+            raw = h.get(f"{api_var}_{mkey}") or h.get(api_var) or [fb] * n
+            data[col] = _c(raw, fb=fb)
+
+        df = pd.DataFrame(data, index=times)
+        try:
+            df.index = df.index.tz_localize(
+                "Europe/Berlin", ambiguous="infer", nonexistent="shift_forward"
+            )
+        except Exception:
+            df.index = df.index.tz_localize(
+                "Europe/Berlin", ambiguous="NaT", nonexistent="shift_forward"
+            )
+            df = df[df.index.notna()]
+
+        df["temp"]  = df["temp"].ffill().fillna(10.0)
+        df["cloud"] = df["cloud"].ffill().fillna(50.0)
+        df["wind"]  = df["wind"].ffill().fillna(3.0)
+        members[mkey] = df.sort_index()
+
+    return members
+
+
+# ---------------------------------------------------------------------------
 # Solar geometry  (must match train_model.py exactly)
 # ---------------------------------------------------------------------------
 
@@ -157,6 +255,47 @@ def _cos_zenith_vec(timestamps: pd.DatetimeIndex, lat: float) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
+# Physics-based PV power estimate
+# Yu et al. 2026: PhysEmbedFormer, eq. 6  –  G_eff decomposition.
+# P_ac = P_physics + P_residual; LightGBM learns only the residual.
+# ---------------------------------------------------------------------------
+
+def _compute_p_physics(
+    weather_df: pd.DataFrame,
+    cluster_info: dict,
+    timestamp_index: pd.DatetimeIndex,
+) -> np.ndarray:
+    """
+    Single-cluster physics-based PV power estimate (Yu et al. 2026 eq. 6).
+
+    G_eff  = G_beam*cos(z) + DHI*k_diff + GHI*rho_g*k_refl
+    P_cell = P_rated * (G_eff/1000) * (1 + gamma*(T_air - 25))
+    P_physics = P_cell * eta
+
+    P_rated is normalised to cluster capacity (GW * 0.001) so the residual
+    target stays on the same scale as the SMARD MW series.
+    """
+    df = (
+        weather_df
+        .reindex(timestamp_index, method="nearest", tolerance=pd.Timedelta("90min"))
+        .fillna(0.0)
+    )
+    ghi   = df["ghi"].values
+    dhi   = df["dhi"].values
+    temp  = df["temp"].values
+    cos_z = _cos_zenith_vec(timestamp_index, cluster_info["lat"])
+
+    g_beam = np.maximum(ghi - dhi, 0.0)
+    g_eff  = np.maximum(
+        g_beam * cos_z + dhi * _K_DIFF + ghi * _RHO_G * _K_REFL,
+        0.0,
+    )
+    p_rated = cluster_info["capacity_gw"] * 0.001   # normalised rated power
+    p_cell  = p_rated * (g_eff / 1000.0) * (1.0 + _GAMMA * (temp - 25.0))
+    return np.maximum(p_cell * _ETA, 0.0)
+
+
+# ---------------------------------------------------------------------------
 # Feature engineering  (identical pipeline to train_model.py)
 # ---------------------------------------------------------------------------
 
@@ -165,6 +304,7 @@ def _build_feature_df(
     extended_index: pd.DatetimeIndex,
     target_date: date,
     locations: list[dict],
+    p_physics: np.ndarray | None = None,   # aligned with extended_index
 ) -> pd.DataFrame:
     """
     Build feature matrix on extended_index (past 9 days + tomorrow),
@@ -221,6 +361,10 @@ def _build_feature_df(
     feat["is_sunny"] = np.array(
         [float(daily_mean.get(ts.date(), 0.0) >= _SUNNY_THRESHOLD) for ts in extended_index]
     )
+
+    # --- Physics-based PV baseline (Yu et al. 2026 PhysEmbedFormer decomposition) ---
+    if p_physics is not None:
+        feat["p_physics"] = p_physics
 
     feat = feat.fillna(0.0)
 
@@ -289,11 +433,35 @@ def transform_payload(
         return payload
 
     # ------------------------------------------------------------------
-    # Step 3: Build feature matrix on the extended window, filter to target_date
+    # Step 3: Compute P_physics baseline, then build feature matrix.
+    # Yu et al. 2026: P_ac = P_physics + P_residual (PhysEmbedFormer).
+    # P_physics is added as a feature so LightGBM predicts the residual.
     # ------------------------------------------------------------------
     try:
         extended_index = weather_dfs[_CLUSTERS[0]["name"]].index
-        X_day_df       = _build_feature_df(weather_dfs, extended_index, target_date, _CLUSTERS)
+    except Exception as exc:
+        print(f"[custom_model_3] Feature engineering failed: {exc}. Using baseline.")
+        return payload
+
+    p_physics_ext  = np.zeros(len(extended_index))
+    physics_ok     = False
+    if _PHYSICS_DECOMP:
+        try:
+            w_sum_phys = sum(loc["weight"] for loc in _CLUSTERS)
+            for loc in _CLUSTERS:
+                p_physics_ext += (
+                    _compute_p_physics(weather_dfs[loc["name"]], loc, extended_index)
+                    * loc["weight"] / w_sum_phys
+                )
+            physics_ok = True
+        except Exception as exc:
+            print(f"[custom_model_3] Physics computation failed: {exc}. Using zeros.")
+
+    try:
+        X_day_df = _build_feature_df(
+            weather_dfs, extended_index, target_date, _CLUSTERS,
+            p_physics=p_physics_ext,
+        )
     except Exception as exc:
         print(f"[custom_model_3] Feature engineering failed: {exc}. Using baseline.")
         return payload
@@ -316,62 +484,182 @@ def transform_payload(
         return payload
 
     try:
-        pred_point = np.maximum(_MODEL_POINT.predict(X_day), 0.0)
-        pred_q10   = np.maximum(_MODEL_Q10.predict(X_day),   0.0)
-        pred_q90   = np.maximum(_MODEL_Q90.predict(X_day),   0.0)
+        pred_residual = _MODEL_POINT.predict(X_day)   # residual (may be negative)
+        pred_q10      = _MODEL_Q10.predict(X_day)
+        pred_q90      = _MODEL_Q90.predict(X_day)
     except Exception as exc:
         print(f"[custom_model_3] Model prediction failed: {exc}. Using baseline.")
         return payload
+
+    # Physics + residual reconstruction (Yu et al. 2026 PhysEmbedFormer)
+    if _PHYSICS_DECOMP and physics_ok:
+        day_mask      = extended_index.date == target_date
+        p_physics_day = p_physics_ext[day_mask]
+        if len(p_physics_day) == len(pred_residual):
+            pred_point = np.maximum(p_physics_day + pred_residual, 0.0)
+        else:
+            pred_point = np.maximum(pred_residual, 0.0)
+    else:
+        pred_point = np.maximum(pred_residual, 0.0)
 
     # Derive per-hour std from Q10/Q90 spread (Gaussian: Q90-Q10 ≈ 3.29σ)
     std_per_hour = np.maximum((pred_q90 - pred_q10) / 3.29, 0.0)
 
     # ------------------------------------------------------------------
-    # Step 5: Resample 24 hourly predictions → n_steps
+    # Step 5: Fetch ECMWF IFS025 ensemble (cached per target_date).
+    # Run the LightGBM point model for each of the 50 members so that
+    # probabilistic outputs are derived from real ensemble spread rather
+    # than a parametric normal distribution.
+    # Sperati et al. 2016: ECMWF ensemble for probabilistic PV forecasting.
+    # Terren-Serrano et al. 2026: ensemble weather forecasts for
+    # probabilistic energy forecasting.
     # ------------------------------------------------------------------
-    mean_forecast = _resample_to_steps(pred_point, n_steps)
-    std_per_step  = _resample_to_steps(std_per_hour, n_steps)
+    ensemble_available = False
+    member_preds_24: np.ndarray | None = None   # shape (50, 24)
+
+    try:
+        if target_date not in _ENSEMBLE_CACHE:
+            ens_loc_data: dict[str, dict] = {}
+            for loc in _CLUSTERS:
+                ens_loc_data[loc["name"]] = _fetch_open_meteo_ensemble(
+                    loc["lat"], loc["lon"], past_days=9
+                )
+                time.sleep(0.3)
+            _ENSEMBLE_CACHE[target_date] = ens_loc_data
+
+        ens_loc_data  = _ENSEMBLE_CACHE[target_date]
+        ens_index     = ens_loc_data[_CLUSTERS[0]["name"]]["member01"].index
+        ens_day_mask  = ens_index.date == target_date
+        w_sum_ens     = sum(loc["weight"] for loc in _CLUSTERS)
+
+        preds_list: list[np.ndarray] = []
+        for mid in range(1, 51):
+            mkey      = f"member{mid:02d}"
+            m_weather = {loc["name"]: ens_loc_data[loc["name"]][mkey] for loc in _CLUSTERS}
+
+            # Per-member physics baseline (Yu et al. 2026: ensemble spread from physics)
+            p_phys_m_ext = np.zeros(len(ens_index))
+            if _PHYSICS_DECOMP:
+                try:
+                    for loc in _CLUSTERS:
+                        p_phys_m_ext += (
+                            _compute_p_physics(m_weather[loc["name"]], loc, ens_index)
+                            * loc["weight"] / w_sum_ens
+                        )
+                except Exception:
+                    p_phys_m_ext = np.zeros(len(ens_index))
+
+            X_m_df    = _build_feature_df(
+                m_weather, ens_index, target_date, _CLUSTERS,
+                p_physics=p_phys_m_ext,
+            )
+            X_m        = X_m_df[_FEATURE_NAMES].values
+            residual_m = _MODEL_POINT.predict(X_m)
+
+            if _PHYSICS_DECOMP:
+                p_phys_m_day = p_phys_m_ext[ens_day_mask]
+                if len(p_phys_m_day) == len(residual_m):
+                    member_pred = np.maximum(p_phys_m_day + residual_m, 0.0)
+                else:
+                    member_pred = np.maximum(residual_m, 0.0)
+            else:
+                member_pred = np.maximum(residual_m, 0.0)
+
+            preds_list.append(member_pred)
+
+        member_preds_24    = np.array(preds_list)    # (50, 24)
+        ensemble_available = True
+        print(
+            f"[custom_model_3] {target_date} ensemble: "
+            f"50 members × 24 h  (ECMWF IFS025 via Open-Meteo)"
+        )
+    except Exception as exc:
+        print(
+            f"[custom_model_3] Ensemble fetch failed: {exc}. "
+            "Falling back to np.random.normal."
+        )
 
     # ------------------------------------------------------------------
-    # Step 6: Night-hour mask
-    # Timesteps below 1% of daily peak → set mean and std to 0.
+    # Step 6: Resample to n_steps; build ensemble matrix at target resolution
     # ------------------------------------------------------------------
-    peak = float(mean_forecast.max()) if mean_forecast.max() > 0 else 1.0
-    night_mask            = mean_forecast < 0.01 * peak
+    if ensemble_available and member_preds_24 is not None:
+        mean_forecast_24 = member_preds_24.mean(axis=0)
+        member_preds_ns  = np.array(                        # (50, n_steps)
+            [_resample_to_steps(m, n_steps) for m in member_preds_24]
+        )
+    else:
+        mean_forecast_24 = pred_point
+        member_preds_ns  = None
+
+    mean_forecast = _resample_to_steps(mean_forecast_24, n_steps)
+    std_per_step  = _resample_to_steps(std_per_hour,     n_steps)
+
+    # ------------------------------------------------------------------
+    # Step 7: Night-hour mask (applied to mean and all ensemble members)
+    # Timesteps below 1% of daily peak → zero out.
+    # ------------------------------------------------------------------
+    peak       = float(mean_forecast.max()) if mean_forecast.max() > 0 else 1.0
+    night_mask = mean_forecast < 0.01 * peak
     mean_forecast[night_mask] = 0.0
     std_per_step[night_mask]  = 0.0
+    if member_preds_ns is not None:
+        member_preds_ns[:, night_mask] = 0.0
 
     print(
         f"[custom_model_3] {target_date}  "
         f"peak={peak:.1f} MW  n_steps={n_steps}  "
         f"night_steps={int(night_mask.sum())}  "
-        f"n_clusters={len(_CLUSTERS)}"
+        f"n_clusters={len(_CLUSTERS)}  "
+        f"ensemble={'yes' if ensemble_available else 'no (fallback)'}"
     )
 
     # ------------------------------------------------------------------
-    # Step 7: Fill payload  (point / 5-quantile / 100-ensemble)
+    # Step 8: Fill payload  (point / 5-quantile / 100-ensemble)
     # ------------------------------------------------------------------
     for index, original_value in enumerate(payload["values"]):
         fval = float(mean_forecast[index]) if index < len(mean_forecast) else 0.0
         std  = float(std_per_step[index])  if index < len(std_per_step)  else 1.0
 
         if isinstance(original_value, (int, float)):
+            # Ensemble mean across 50 members (or deterministic if unavailable)
             payload["values"][index] = fval
 
         elif isinstance(original_value, list) and len(original_value) == 5:
-            # [Q10, Q25, Q50, Q75, Q90]
-            payload["values"][index] = [
-                float(max(0.0, fval - 2.0 * std)),
-                float(max(0.0, fval - 0.7 * std)),
-                float(fval),
-                float(fval + 0.7 * std),
-                float(fval + 2.0 * std),
-            ]
+            if ensemble_available and member_preds_ns is not None:
+                # Per-timestep empirical quantiles from 50 ECMWF members
+                # Sperati et al. 2016: empirical quantiles from ensemble spread
+                vals = member_preds_ns[:, index]
+                payload["values"][index] = [
+                    float(np.percentile(vals, 10)),
+                    float(np.percentile(vals, 25)),
+                    float(np.percentile(vals, 50)),
+                    float(np.percentile(vals, 75)),
+                    float(np.percentile(vals, 90)),
+                ]
+            else:
+                # Fallback: Gaussian spread derived from Q10/Q90 model
+                payload["values"][index] = [
+                    float(max(0.0, fval - 2.0 * std)),
+                    float(max(0.0, fval - 0.7 * std)),
+                    float(fval),
+                    float(fval + 0.7 * std),
+                    float(fval + 2.0 * std),
+                ]
 
         elif isinstance(original_value, list) and len(original_value) == 100:
-            np.random.seed(index)
-            ensemble = np.random.normal(loc=fval, scale=max(std, 0.01), size=100)
-            payload["values"][index] = [float(v) for v in np.maximum(ensemble, 0.0)]
+            if ensemble_available and member_preds_ns is not None:
+                # 50 ECMWF members → 100 via duplication with 2% jitter
+                # Terren-Serrano et al. 2026: ensemble resampling for 100-member format
+                members_50 = member_preds_ns[:, index]
+                np.random.seed(index)
+                jitter      = np.random.normal(0, 0.02, 50)
+                members_100 = np.concatenate([members_50, members_50 * (1 + jitter)])
+                payload["values"][index] = [float(v) for v in np.maximum(members_100, 0.0)]
+            else:
+                # Fallback: Gaussian sample
+                np.random.seed(index)
+                ensemble = np.random.normal(loc=fval, scale=max(std, 0.01), size=100)
+                payload["values"][index] = [float(v) for v in np.maximum(ensemble, 0.0)]
 
         else:
             if isinstance(original_value, list):

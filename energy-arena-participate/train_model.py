@@ -11,21 +11,24 @@ installed PV capacity rather than hand-picked city coordinates.
 
 Outputs saved to ./model_artifacts/:
     clusters.json               – 10 cluster centroids + capacity weights
-    lgbm_point.pkl              – point forecast model
-    lgbm_quantile_low.pkl       – Q10 model
-    lgbm_quantile_high.pkl      – Q90 model
-    feature_names.json          – ordered feature list
+    lgbm_point.pkl              – point forecast model  (trained on residual)
+    lgbm_quantile_low.pkl       – Q10 model             (trained on residual)
+    lgbm_quantile_high.pkl      – Q90 model             (trained on residual)
+    feature_names.json          – ordered feature list  (includes p_physics)
+    physics_scaler.json         – mean/std of P_physics training baseline
     training_stats.json         – RMSE per CV fold, run metadata
-    validation_plot.png         – last-30-days actual vs predicted
+    validation_plot.png         – last-30-days actual vs P_physics+LightGBM
     feature_importance_plot.png – top-30 LightGBM feature importances
     cluster_map.png             – cluster centroids on Germany lat/lon map
     shap_summary.png            – SHAP beeswarm (last 30 days)
     shap_bar.png                – mean |SHAP| bar chart (last 30 days)
 
 References:
-    Nespoli et al. 2019:       150 W/m² daily mean GHI → sunny/cloudy threshold
+    Nespoli et al. 2019:        150 W/m² daily mean GHI → sunny/cloudy threshold
     Terren-Serrano et al. 2026: ERA5 reanalysis for training, NWP for inference;
                                 capacity-density spatial masking for site selection
+    Yu et al. 2026:             PhysEmbedFormer: physics-guided decomposition
+                                P_ac = P_physics + P_residual (eq. 6 for G_eff)
 """
 from __future__ import annotations
 
@@ -66,6 +69,14 @@ MASTR_PARQUET  = ARTIFACT_DIR / "mastr_clusters_raw.parquet"  # primary cache (s
 
 # Nespoli et al. 2019, §2.3
 SUNNY_THRESHOLD = 150.0  # W/m²
+
+# Yu et al. 2026: PV panel physics parameters (eq. 6)
+_TILT_RAD = np.radians(20.0)                              # typical German rooftop
+_K_DIFF   = 0.5 * (1.0 + np.cos(_TILT_RAD))              # diffuse view factor ≈ 0.970
+_RHO_G    = 0.2                                           # ground reflectance
+_K_REFL   = 0.5 * _RHO_G * (1.0 - np.cos(_TILT_RAD))    # reflected component ≈ 0.006
+_GAMMA    = -0.004                                        # temperature coefficient /°C
+_ETA      = 0.96                                          # inverter efficiency
 
 # SMARD module 125 = PV actual generation, DE-LU, quarter-hour
 SMARD_MODULE = 125
@@ -452,6 +463,46 @@ def cos_zenith_vec(timestamps: pd.DatetimeIndex, lat: float) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
+# Physics-based PV power estimate
+# Yu et al. 2026: PhysEmbedFormer, eq. 6  –  G_eff decomposition.
+# LightGBM is trained on P_residual = P_actual - P_physics.
+# ---------------------------------------------------------------------------
+
+def _compute_p_physics(
+    weather_df: pd.DataFrame,
+    cluster_info: dict,
+    timestamp_index: pd.DatetimeIndex,
+) -> np.ndarray:
+    """
+    Single-cluster physics-based PV power estimate (Yu et al. 2026 eq. 6).
+
+    G_eff  = G_beam*cos(z) + DHI*k_diff + GHI*rho_g*k_refl
+    P_cell = P_rated * (G_eff/1000) * (1 + gamma*(T_air - 25))
+    P_physics = P_cell * eta
+
+    P_rated is normalised: capacity_gw * 0.001 (shape matters, not absolute scale).
+    """
+    df = (
+        weather_df
+        .reindex(timestamp_index, method="nearest", tolerance=pd.Timedelta("90min"))
+        .fillna(0.0)
+    )
+    ghi   = df["ghi"].values
+    dhi   = df["dhi"].values
+    temp  = df["temp"].values
+    cos_z = cos_zenith_vec(timestamp_index, cluster_info["lat"])
+
+    g_beam = np.maximum(ghi - dhi, 0.0)
+    g_eff  = np.maximum(
+        g_beam * cos_z + dhi * _K_DIFF + ghi * _RHO_G * _K_REFL,
+        0.0,
+    )
+    p_rated = cluster_info["capacity_gw"] * 0.001
+    p_cell  = p_rated * (g_eff / 1000.0) * (1.0 + _GAMMA * (temp - 25.0))
+    return np.maximum(p_cell * _ETA, 0.0)
+
+
+# ---------------------------------------------------------------------------
 # Feature engineering
 # ---------------------------------------------------------------------------
 
@@ -459,6 +510,7 @@ def build_feature_df(
     weather_dfs: dict[str, pd.DataFrame],
     common_index: pd.DatetimeIndex,
     locations: list[dict],
+    p_physics: np.ndarray | None = None,   # aligned with common_index
 ) -> pd.DataFrame:
     """
     Build the complete hourly feature matrix.
@@ -473,8 +525,9 @@ def build_feature_df(
        3  lag-1d, lag-2d, lag-7d GHI
        1  3-day rolling mean GHI
        1  binary sunny/cloudy flag      – daily mean GHI >= 150 W/m²
+       1  p_physics                     – Yu et al. 2026 physics baseline (optional)
 
-    Total: 80 features for N_CLUSTERS=10.
+    Total: 80 features for N_CLUSTERS=10 (81 with p_physics).
     """
     feat  = pd.DataFrame(index=common_index)
     w_sum = sum(loc["weight"] for loc in locations)  # ≈ 1.0
@@ -524,6 +577,10 @@ def build_feature_df(
     feat["is_sunny"] = np.array(
         [float(daily_mean.get(ts.date(), 0.0) >= SUNNY_THRESHOLD) for ts in common_index]
     )
+
+    # --- Physics-based PV baseline (Yu et al. 2026 PhysEmbedFormer decomposition) ---
+    if p_physics is not None:
+        feat["p_physics"] = p_physics
 
     return feat.fillna(0.0)
 
@@ -593,11 +650,26 @@ def main() -> None:
         time.sleep(1.5)
 
     # ------------------------------------------------------------------
-    # 4. Build feature matrix
+    # 4. Compute P_physics baseline, then build feature matrix.
+    # Yu et al. 2026: P_ac = P_physics + P_residual (PhysEmbedFormer, eq. 6).
     # ------------------------------------------------------------------
     common_index = weather_dfs[clusters[0]["name"]].index
+    print(f"Computing physics-based PV baseline (Yu et al. 2026 eq. 6) …")
+    w_sum_phys     = sum(c["weight"] for c in clusters)
+    p_physics_full = np.zeros(len(common_index))
+    for c in clusters:
+        p_physics_full += (
+            _compute_p_physics(weather_dfs[c["name"]], c, common_index)
+            * c["weight"] / w_sum_phys
+        )
+    print(
+        f"  P_physics: mean={p_physics_full.mean():.4f}, "
+        f"max={p_physics_full.max():.4f}, "
+        f"nonzero={int((p_physics_full > 0).sum()):,} h"
+    )
+
     print(f"Building feature matrix ({len(common_index):,} hourly steps) …")
-    X_df         = build_feature_df(weather_dfs, common_index, clusters)
+    X_df          = build_feature_df(weather_dfs, common_index, clusters, p_physics=p_physics_full)
     feature_names = list(X_df.columns)
     X             = X_df.values
     print(f"  Shape: {X.shape[0]:,} × {X.shape[1]} features")
@@ -621,11 +693,18 @@ def main() -> None:
             0.0,
         )
 
-    # Drop rows where target is NaN or negative
-    mask          = np.isfinite(y) & (y >= 0)
-    X, y          = X[mask], y[mask]
-    idx_m         = common_index[mask]
-    print(f"  Samples after NaN removal: {len(y):,}")
+    # Physics decomposition: LightGBM learns P_residual = P_actual - P_physics
+    # Yu et al. 2026: PhysEmbedFormer – physics-guided target decomposition.
+    y_residual = y - p_physics_full    # may be negative at night/overcast hours
+
+    # Drop rows where SMARD target is NaN or negative
+    mask      = np.isfinite(y) & (y >= 0)
+    X         = X[mask]
+    y_smard_m = y[mask]                # original SMARD values (for validation)
+    y_train   = y_residual[mask]       # residual target for LightGBM
+    p_phys_m  = p_physics_full[mask]   # physics baseline (for validation)
+    idx_m     = common_index[mask]
+    print(f"  Samples after NaN removal: {len(y_train):,}")
 
     # ------------------------------------------------------------------
     # 6. Sample weights: last 6 months → 2×, older → 1×
@@ -646,15 +725,17 @@ def main() -> None:
     for fold, (tr, va) in enumerate(tscv.split(X)):
         cv_m = lgb.LGBMRegressor(**_lgbm_params("regression"))
         cv_m.fit(
-            X[tr], y[tr],
+            X[tr], y_train[tr],
             sample_weight=sample_weight[tr],
-            eval_set=[(X[va], y[va])],
+            eval_set=[(X[va], y_train[va])],
             callbacks=[
                 lgb.early_stopping(stopping_rounds=50, verbose=False),
                 lgb.log_evaluation(period=0),
             ],
         )
-        rmse = float(np.sqrt(mean_squared_error(y[va], cv_m.predict(X[va]))))
+        # RMSE on reconstructed full forecast (physics + residual) vs SMARD
+        pred_va = np.maximum(p_phys_m[va] + cv_m.predict(X[va]), 0.0)
+        rmse    = float(np.sqrt(mean_squared_error(y_smard_m[va], pred_va)))
         rmse_folds.append(rmse)
         print(f"  Fold {fold+1}: RMSE = {rmse:.2f} MW")
     print(f"CV RMSE: {np.mean(rmse_folds):.2f} ± {np.std(rmse_folds):.2f} MW")
@@ -664,13 +745,13 @@ def main() -> None:
     # ------------------------------------------------------------------
     print("Fitting final models on all data …")
     model_point = lgb.LGBMRegressor(**_lgbm_params("regression"))
-    model_point.fit(X, y, sample_weight=sample_weight)
+    model_point.fit(X, y_train, sample_weight=sample_weight)
 
     model_q10 = lgb.LGBMRegressor(**_lgbm_params("quantile", alpha=0.10))
-    model_q10.fit(X, y, sample_weight=sample_weight)
+    model_q10.fit(X, y_train, sample_weight=sample_weight)
 
     model_q90 = lgb.LGBMRegressor(**_lgbm_params("quantile", alpha=0.90))
-    model_q90.fit(X, y, sample_weight=sample_weight)
+    model_q90.fit(X, y_train, sample_weight=sample_weight)
     print("[✓] All three models trained.")
 
     # Feature importances (top 15)
@@ -692,21 +773,35 @@ def main() -> None:
     )
 
     stats = {
-        "training_date":   date.today().isoformat(),
-        "train_start":     TRAIN_START.isoformat(),
-        "train_end":       TRAIN_END.isoformat(),
-        "n_samples":       int(len(y)),
-        "n_features":      len(feature_names),
-        "n_clusters":      len(clusters),
-        "smard_available": smard_ok,
-        "cv_rmse_folds":   [round(r, 4) for r in rmse_folds],
-        "cv_rmse_mean":    round(float(np.mean(rmse_folds)), 4),
-        "cv_rmse_std":     round(float(np.std(rmse_folds)),  4),
-        "clusters":        clusters,
+        "training_date":        date.today().isoformat(),
+        "train_start":          TRAIN_START.isoformat(),
+        "train_end":            TRAIN_END.isoformat(),
+        "n_samples":            int(len(y_train)),
+        "n_features":           len(feature_names),
+        "n_clusters":           len(clusters),
+        "smard_available":      smard_ok,
+        "physics_decomposition": True,
+        "cv_rmse_folds":        [round(r, 4) for r in rmse_folds],
+        "cv_rmse_mean":         round(float(np.mean(rmse_folds)), 4),
+        "cv_rmse_std":          round(float(np.std(rmse_folds)),  4),
+        "clusters":             clusters,
     }
     (ARTIFACT_DIR / "training_stats.json").write_text(
         json.dumps(stats, indent=2, ensure_ascii=False), encoding="utf-8"
     )
+
+    physics_scaler = {
+        "mean": float(p_phys_m.mean()),
+        "std":  float(p_phys_m.std()),
+    }
+    (ARTIFACT_DIR / "physics_scaler.json").write_text(
+        json.dumps(physics_scaler, indent=2), encoding="utf-8"
+    )
+    print(
+        f"[✓] physics_scaler.json saved  "
+        f"(mean={physics_scaler['mean']:.4f}, std={physics_scaler['std']:.4f})"
+    )
+
     print(f"\n[✓] All artifacts saved to {ARTIFACT_DIR}")
 
     # ------------------------------------------------------------------
@@ -714,13 +809,13 @@ def main() -> None:
     # ------------------------------------------------------------------
     cut      = idx_m[-1] - pd.Timedelta(days=30)
     pm       = idx_m >= cut
-    y_actual = y[pm]
-    y_pred   = model_point.predict(X[pm])
+    y_actual = y_smard_m[pm]
+    y_pred   = np.maximum(p_phys_m[pm] + model_point.predict(X[pm]), 0.0)
     rmse_p   = float(np.sqrt(mean_squared_error(y_actual, y_pred)))
 
     fig, ax = plt.subplots(figsize=(16, 4))
     ax.plot(idx_m[pm], y_actual, label="Actual (SMARD)", alpha=0.85, lw=0.8)
-    ax.plot(idx_m[pm], y_pred,   label="Predicted (LightGBM)", alpha=0.85, lw=0.8)
+    ax.plot(idx_m[pm], y_pred,   label="Predicted (P_physics + LightGBM residual)", alpha=0.85, lw=0.8)
     ax.set_title(f"PV Forecast – Last 30 Days Validation  (RMSE = {rmse_p:.1f} MW)")
     ax.set_ylabel("MW")
     ax.legend(loc="upper left")

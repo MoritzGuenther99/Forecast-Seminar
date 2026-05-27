@@ -1,20 +1,21 @@
 {
-  "training_date": "2026-05-22",
-  "train_start": "2024-05-17",
-  "train_end": "2026-05-17",
+  "training_date": "2026-05-27",
+  "train_start": "2024-05-22",
+  "train_end": "2026-05-22",
   "n_samples": 17542,
-  "n_features": 80,
+  "n_features": 81,
   "n_clusters": 10,
   "smard_available": true,
+  "physics_decomposition": true,
   "cv_rmse_folds": [
-    3787.044,
-    2696.8978,
-    1700.211,
-    1832.8183,
-    2571.737
+    2827.5163,
+    2687.605,
+    1745.4061,
+    1767.0123,
+    2601.8928
   ],
-  "cv_rmse_mean": 2517.7416,
-  "cv_rmse_std": 746.139,
+  "cv_rmse_mean": 2325.8865,
+  "cv_rmse_std": 470.7335,
   "clusters": [
     {
       "name": "cluster_0",
