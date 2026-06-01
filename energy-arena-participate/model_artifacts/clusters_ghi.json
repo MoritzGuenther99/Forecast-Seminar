@@ -1,0 +1,72 @@
+[
+  {
+    "name": "cluster_0",
+    "lat": 50.0009,
+    "lon": 12.2161,
+    "weight": 0.339154,
+    "capacity_gw": 22.582
+  },
+  {
+    "name": "cluster_1",
+    "lat": 49.768,
+    "lon": 9.083,
+    "weight": 0.20601,
+    "capacity_gw": 13.717
+  },
+  {
+    "name": "cluster_2",
+    "lat": 53.0519,
+    "lon": 12.6568,
+    "weight": 0.173854,
+    "capacity_gw": 11.576
+  },
+  {
+    "name": "cluster_3",
+    "lat": 51.8733,
+    "lon": 7.9757,
+    "weight": 0.142648,
+    "capacity_gw": 9.498
+  },
+  {
+    "name": "cluster_4",
+    "lat": 53.9882,
+    "lon": 9.2211,
+    "weight": 0.066035,
+    "capacity_gw": 4.397
+  },
+  {
+    "name": "cluster_5",
+    "lat": 48.2522,
+    "lon": 8.6635,
+    "weight": 0.045405,
+    "capacity_gw": 3.023
+  },
+  {
+    "name": "cluster_6",
+    "lat": 47.5,
+    "lon": 10.8055,
+    "weight": 0.023002,
+    "capacity_gw": 1.532
+  },
+  {
+    "name": "cluster_7",
+    "lat": 48.4998,
+    "lon": 14.0005,
+    "weight": 0.002456,
+    "capacity_gw": 0.164
+  },
+  {
+    "name": "cluster_8",
+    "lat": 54.6568,
+    "lon": 14.1568,
+    "weight": 0.001303,
+    "capacity_gw": 0.087
+  },
+  {
+    "name": "cluster_9",
+    "lat": 54.4348,
+    "lon": 7.8258,
+    "weight": 0.000133,
+    "capacity_gw": 0.009
+  }
+]

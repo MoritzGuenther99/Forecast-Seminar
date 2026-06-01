@@ -144,10 +144,11 @@ def _load_solar_xml(path: Path) -> pd.DataFrame | None:
                 return (elem.findtext(tag) or "").strip().replace(",", ".")
 
             rows.append({
-                "lat":  _f("Breitengrad"),
-                "lon":  _f("Laengengrad"),
-                "kw":   _f("Nettonennleistung"),
-                "land": (elem.findtext("Bundesland") or "").strip(),
+                "lat":               _f("Breitengrad"),
+                "lon":               _f("Laengengrad"),
+                "kw":                _f("Nettonennleistung"),
+                "land":              (elem.findtext("Bundesland") or "").strip(),
+                "Inbetriebnahmedatum": _f("Inbetriebnahmedatum"),
             })
             elem.clear()
     except ET.ParseError as exc:
@@ -166,7 +167,8 @@ def _load_solar_xml(path: Path) -> pd.DataFrame | None:
 
     df = df.dropna(subset=["lat", "lon", "kw"])
     df = df[df["kw"] > 0].copy()
-    return df[["lat", "lon", "kw", "land"]].reset_index(drop=True)
+    df["Inbetriebnahmedatum"] = df["Inbetriebnahmedatum"].replace("", np.nan)
+    return df[["lat", "lon", "kw", "land", "Inbetriebnahmedatum"]].reset_index(drop=True)
 
 
 def _parse_mastr_from_zip(zip_path: Path) -> pd.DataFrame:
@@ -222,7 +224,16 @@ def load_mastr_plants() -> pd.DataFrame:
 
     if MASTR_PARQUET.exists():
         print(f"[MaStR] Loading from parquet cache: {MASTR_PARQUET}")
-        return pd.read_parquet(MASTR_PARQUET)
+        df = pd.read_parquet(MASTR_PARQUET)
+        if "Inbetriebnahmedatum" not in df.columns:
+            if MASTR_ZIP_PATH.exists():
+                print("[MaStR] Parquet lacks Inbetriebnahmedatum; re-parsing ZIP …")
+                df = _parse_mastr_from_zip(MASTR_ZIP_PATH)
+                df.to_parquet(MASTR_PARQUET)
+                print(f"[MaStR] Parquet updated with Inbetriebnahmedatum: {MASTR_PARQUET}")
+            else:
+                print("[MaStR] No ZIP cached; capacity normalization will be skipped.")
+        return df
 
     if not MASTR_ZIP_PATH.exists():
         _download_zip(MASTR_URL, MASTR_ZIP_PATH)
@@ -233,6 +244,97 @@ def load_mastr_plants() -> pd.DataFrame:
     df.to_parquet(MASTR_PARQUET)
     print(f"[MaStR] Parquet cache saved: {MASTR_PARQUET}  ({len(df):,} plants)")
     return df
+
+
+# ---------------------------------------------------------------------------
+# Monthly installed capacity timeline (Nespoli et al. 2019 / BNetzA MaStR)
+# ---------------------------------------------------------------------------
+
+def _build_capacity_timeline(df_plants: pd.DataFrame) -> tuple[dict | None, float | None]:
+    """
+    Compute monthly cumulative installed PV capacity from MaStR Inbetriebnahmedatum.
+
+    Returns (timeline_dict, cap_ref_gw) where timeline_dict maps "YYYY-MM" → GW
+    and cap_ref_gw is the capacity at TRAIN_END.
+    Returns (None, None) if commissioning date data is unavailable.
+
+    Reference: Nespoli et al. 2019 / BNetzA MaStR – capacity normalization of the
+    SMARD training target removes PV fleet growth non-stationarity across 2024-26.
+    """
+    if "Inbetriebnahmedatum" not in df_plants.columns:
+        print("[Capacity] Inbetriebnahmedatum missing from parquet; skipping normalization.")
+        return None, None
+
+    df = df_plants[["kw", "Inbetriebnahmedatum"]].copy()
+    df = df.dropna(subset=["Inbetriebnahmedatum"])
+    df = df[df["Inbetriebnahmedatum"].astype(str).str.strip() != ""]
+
+    # Try multiple date formats; keep the parse that yields the most valid dates
+    best_parsed: pd.Series | None = None
+    best_count  = 0
+    for fmt in [None, "%Y-%m-%d", "%d.%m.%Y", "%Y-%m-%dT%H:%M:%S", "%Y/%m/%d"]:
+        try:
+            parsed  = pd.to_datetime(df["Inbetriebnahmedatum"], format=fmt, errors="coerce")
+            n_valid = int(parsed.notna().sum())
+            if n_valid > best_count:
+                best_parsed, best_count = parsed, n_valid
+        except Exception:
+            continue
+
+    if best_parsed is None or best_count == 0:
+        print("[Capacity] Could not parse Inbetriebnahmedatum; skipping normalization.")
+        return None, None
+
+    df["commission_date"] = best_parsed
+    df = df.dropna(subset=["commission_date"])
+    print(f"[Capacity] {len(df):,} plants with valid commissioning date ({best_count:,} parsed)")
+
+    # Monthly additions → cumulative capacity in GW
+    df["month"] = df["commission_date"].dt.to_period("M")
+    monthly = df.groupby("month")["kw"].sum() / 1e6
+
+    train_start_p = pd.Period(TRAIN_START.strftime("%Y-%m"), freq="M")
+    train_end_p   = pd.Period(TRAIN_END.strftime("%Y-%m"),   freq="M")
+
+    full_range   = pd.period_range(monthly.index.min(), train_end_p, freq="M")
+    monthly_full = monthly.reindex(full_range, fill_value=0.0)
+    cumulative   = monthly_full.cumsum()
+
+    training_range = pd.period_range(train_start_p, train_end_p, freq="M")
+    cap_series     = cumulative.reindex(training_range).ffill().fillna(0.0)
+
+    cap_ref_gw   = float(cap_series.iloc[-1])
+    cap_start_gw = float(cap_series.iloc[0])
+    growth_pct   = (cap_ref_gw - cap_start_gw) / max(cap_start_gw, 0.001) * 100.0
+
+    print(f"[Capacity] Capacity at TRAIN_START ({TRAIN_START}): {cap_start_gw:.1f} GW")
+    print(f"[Capacity] Capacity at TRAIN_END   ({TRAIN_END}):   {cap_ref_gw:.1f} GW")
+    print(f"[Capacity] Growth: {growth_pct:.1f}% over training period")
+    print("[Capacity] Normalizing all SMARD values by capacity growth factor")
+
+    timeline_dict = {str(p): round(float(v), 3) for p, v in cap_series.items()}
+
+    (ARTIFACT_DIR / "capacity_timeline.json").write_text(
+        json.dumps(timeline_dict, indent=2), encoding="utf-8"
+    )
+    print(f"[✓] capacity_timeline.json saved ({len(timeline_dict)} months)")
+
+    months_ts = [pd.Period(k, freq="M").to_timestamp() for k in timeline_dict]
+    caps_gw   = list(timeline_dict.values())
+
+    fig, ax = plt.subplots(figsize=(12, 4))
+    ax.plot(months_ts, caps_gw, lw=1.5, color="tab:orange")
+    ax.fill_between(months_ts, caps_gw, alpha=0.3, color="tab:orange")
+    ax.set_xlabel("Month")
+    ax.set_ylabel("Installed Capacity (GW)")
+    ax.set_title("Germany Installed PV Capacity Growth (MaStR)")
+    ax.grid(alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(ARTIFACT_DIR / "capacity_growth.png", dpi=130)
+    plt.close(fig)
+    print("[✓] capacity_growth.png saved")
+
+    return timeline_dict, cap_ref_gw
 
 
 # ---------------------------------------------------------------------------
@@ -630,6 +732,17 @@ def main() -> None:
     print(f"[MaStR] After Germany geo-filter: {len(df_plants):,} plants")
 
     # ------------------------------------------------------------------
+    # 1b. Build monthly capacity timeline for SMARD normalization.
+    # Nespoli et al. 2019 / BNetzA: capacity normalization removes the
+    # PV fleet growth trend from the raw MW training target so the model
+    # learns stable weather → capacity-factor relationships.
+    # Plants with missing commissioning date are excluded from the
+    # timeline but kept in clustering (geo-coordinates still valid).
+    # ------------------------------------------------------------------
+    capacity_timeline, cap_ref_gw = _build_capacity_timeline(df_plants)
+    capacity_ok = capacity_timeline is not None
+
+    # ------------------------------------------------------------------
     # 2. Capacity-weighted clustering → 10 representative locations
     # ------------------------------------------------------------------
     clusters = cluster_plants(df_plants, N_CLUSTERS)
@@ -691,6 +804,23 @@ def main() -> None:
             X_df["w_ghi"].values * 0.15
             + rng.normal(0, X_df["w_ghi"].values * 0.03 + 0.5),
             0.0,
+        )
+
+    # ------------------------------------------------------------------
+    # Step 5b: Normalize SMARD target by installed capacity growth.
+    # Nespoli et al. 2019: scaling raw MW values to cap_ref-equivalent MW
+    # removes the non-stationarity from PV fleet growth during 2024-26.
+    # Formula: y_norm = y_smard * (cap_ref / cap_t)
+    # At inference time NO scaling is needed — the model already predicts
+    # in cap_ref (current-capacity) MW units.
+    # ------------------------------------------------------------------
+    if smard_ok and capacity_ok:
+        month_keys = [ts.strftime("%Y-%m") for ts in common_index]
+        cap_t      = np.array([capacity_timeline.get(mk, cap_ref_gw) for mk in month_keys])
+        cap_t      = np.maximum(cap_t, 0.001)
+        y          = y * (cap_ref_gw / cap_t)
+        print(
+            f"[Capacity] SMARD target normalized to cap_ref={cap_ref_gw:.2f} GW equivalent"
         )
 
     # Physics decomposition: LightGBM learns P_residual = P_actual - P_physics
@@ -794,12 +924,15 @@ def main() -> None:
         "mean": float(p_phys_m.mean()),
         "std":  float(p_phys_m.std()),
     }
+    if cap_ref_gw is not None:
+        physics_scaler["cap_ref_gw"] = round(float(cap_ref_gw), 3)
     (ARTIFACT_DIR / "physics_scaler.json").write_text(
         json.dumps(physics_scaler, indent=2), encoding="utf-8"
     )
     print(
         f"[✓] physics_scaler.json saved  "
-        f"(mean={physics_scaler['mean']:.4f}, std={physics_scaler['std']:.4f})"
+        f"(mean={physics_scaler['mean']:.4f}, std={physics_scaler['std']:.4f}"
+        + (f", cap_ref_gw={physics_scaler['cap_ref_gw']:.2f} GW)" if cap_ref_gw is not None else ")")
     )
 
     print(f"\n[✓] All artifacts saved to {ARTIFACT_DIR}")
@@ -916,6 +1049,14 @@ def main() -> None:
     plt.close()
     print("[✓] shap_bar.png saved")
 
+    if capacity_ok:
+        print(
+            "\n[!] Capacity-normalized training complete. "
+            f"Model predictions are in cap_ref={cap_ref_gw:.2f} GW (current-capacity) MW units. "
+            "No inference-time scaling is needed in custom_model_3.py.\n"
+            "[!] RETRAIN REQUIRED: re-run train_model.py to apply capacity normalization "
+            "if models were trained without it."
+        )
     print("Done.")
 
 

@@ -37,6 +37,7 @@ _FEATURE_NAMES: list[str]  = []
 _CLUSTERS:      list[dict] = []   # loaded from clusters.json
 _ENSEMBLE_CACHE: dict      = {}   # target_date → {loc_name: {member_id: pd.DataFrame}}
 _PHYSICS_DECOMP: bool      = False  # True when loaded model includes p_physics feature
+_CAP_REF_GW: float | None  = None  # reference capacity used during training normalization
 
 _ARTIFACT_DIR = Path(__file__).resolve().parent / "model_artifacts"
 
@@ -63,7 +64,7 @@ def _load_models() -> bool:
     so transform_payload can fall back to the baseline payload.
     """
     global _MODELS_LOADED, _MODEL_POINT, _MODEL_Q10, _MODEL_Q90
-    global _FEATURE_NAMES, _CLUSTERS, _PHYSICS_DECOMP
+    global _FEATURE_NAMES, _CLUSTERS, _PHYSICS_DECOMP, _CAP_REF_GW
 
     if _MODELS_LOADED:
         return True
@@ -81,10 +82,20 @@ def _load_models() -> bool:
             (_ARTIFACT_DIR / "clusters.json").read_text(encoding="utf-8")
         )
         _PHYSICS_DECOMP = "p_physics" in _FEATURE_NAMES
+
+        # Load reference capacity used during training normalization (Nespoli et al. 2019).
+        # Predictions are already in cap_ref MW units — no inference-time scaling needed.
+        try:
+            _ps = json.loads((_ARTIFACT_DIR / "physics_scaler.json").read_text(encoding="utf-8"))
+            _CAP_REF_GW = float(_ps["cap_ref_gw"]) if "cap_ref_gw" in _ps else None
+        except Exception:
+            _CAP_REF_GW = None
+
         _MODELS_LOADED  = True
         print(
             f"[custom_model_3] Loaded {len(_CLUSTERS)} clusters, "
             f"{len(_FEATURE_NAMES)} features  ←  {_ARTIFACT_DIR}"
+            + (f"  cap_ref={_CAP_REF_GW:.2f} GW" if _CAP_REF_GW is not None else "")
         )
         if not _PHYSICS_DECOMP:
             print(
@@ -407,6 +418,12 @@ def transform_payload(
     LightGBM PV forecast using Open-Meteo NWP features at MaStR-derived cluster locations.
     Falls back to the unmodified baseline payload if models are unavailable or any
     API call fails.
+
+    Note on capacity normalization (Nespoli et al. 2019 / BNetzA MaStR):
+    The training target was scaled to cap_ref MW units (capacity at TRAIN_END) so the
+    model learns stable weather→power relationships across the 2-year training window.
+    Predictions are already in current-capacity MW — no inference-time rescaling needed.
+    cap_ref_gw is loaded from physics_scaler.json for logging only (_CAP_REF_GW).
     """
     n_steps = len(payload["values"])
 
@@ -595,6 +612,19 @@ def transform_payload(
     std_per_step  = _resample_to_steps(std_per_hour,     n_steps)
 
     # ------------------------------------------------------------------
+    # Step 6b: Spread correction based on sunny/cloudy classification.
+    # Nespoli et al. 2019: daily mean GHI >= 150 W/m² → sunny day.
+    # Wider spread for cloudy days (higher uncertainty), tighter for sunny.
+    # ------------------------------------------------------------------
+    daily_mean_wghi = float(X_day_df["w_ghi"].mean())
+    is_sunny        = daily_mean_wghi >= _SUNNY_THRESHOLD
+    spread_factor   = 0.8 if is_sunny else 1.5
+    if ensemble_available and member_preds_ns is not None:
+        ensemble_mean   = member_preds_ns.mean(axis=0)
+        deviations      = member_preds_ns - ensemble_mean
+        member_preds_ns = np.maximum(ensemble_mean + deviations * spread_factor, 0.0)
+
+    # ------------------------------------------------------------------
     # Step 7: Night-hour mask (applied to mean and all ensemble members)
     # Timesteps below 1% of daily peak → zero out.
     # ------------------------------------------------------------------
@@ -610,7 +640,8 @@ def transform_payload(
         f"peak={peak:.1f} MW  n_steps={n_steps}  "
         f"night_steps={int(night_mask.sum())}  "
         f"n_clusters={len(_CLUSTERS)}  "
-        f"ensemble={'yes' if ensemble_available else 'no (fallback)'}"
+        f"ensemble={'yes' if ensemble_available else 'no (fallback)'}  "
+        f"spread_factor={spread_factor:.2f} ({'sunny' if is_sunny else 'cloudy'})"
     )
 
     # ------------------------------------------------------------------
