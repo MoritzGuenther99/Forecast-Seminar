@@ -84,7 +84,7 @@ SMARD_REGION = "DE-LU"
 
 _TODAY      = date.today()
 TRAIN_END   = _TODAY - timedelta(days=5)   # buffer for SMARD publication lag
-TRAIN_START = date(_TODAY.year - 2, _TODAY.month, _TODAY.day) - timedelta(days=5)
+TRAIN_START = date(_TODAY.year - 4, _TODAY.month, _TODAY.day) - timedelta(days=5)
 
 
 # ---------------------------------------------------------------------------
@@ -858,6 +858,7 @@ def main() -> None:
             X[tr], y_train[tr],
             sample_weight=sample_weight[tr],
             eval_set=[(X[va], y_train[va])],
+            feature_name=feature_names,
             callbacks=[
                 lgb.early_stopping(stopping_rounds=50, verbose=False),
                 lgb.log_evaluation(period=0),
@@ -875,13 +876,13 @@ def main() -> None:
     # ------------------------------------------------------------------
     print("Fitting final models on all data …")
     model_point = lgb.LGBMRegressor(**_lgbm_params("regression"))
-    model_point.fit(X, y_train, sample_weight=sample_weight)
+    model_point.fit(X, y_train, sample_weight=sample_weight, feature_name=feature_names)
 
     model_q10 = lgb.LGBMRegressor(**_lgbm_params("quantile", alpha=0.10))
-    model_q10.fit(X, y_train, sample_weight=sample_weight)
+    model_q10.fit(X, y_train, sample_weight=sample_weight, feature_name=feature_names)
 
     model_q90 = lgb.LGBMRegressor(**_lgbm_params("quantile", alpha=0.90))
-    model_q90.fit(X, y_train, sample_weight=sample_weight)
+    model_q90.fit(X, y_train, sample_weight=sample_weight, feature_name=feature_names)
     print("[✓] All three models trained.")
 
     # Feature importances (top 15)
