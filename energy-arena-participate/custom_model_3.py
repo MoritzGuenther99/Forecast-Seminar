@@ -54,6 +54,67 @@ _ETA      = 0.96                                          # inverter efficiency
 
 
 # ---------------------------------------------------------------------------
+# Recent SMARD PV fetch (for lag_1d_pv / lag_7d_pv inference features)
+# ---------------------------------------------------------------------------
+
+def _fetch_recent_smard_pv(n_days: int = 9) -> pd.Series | None:
+    """
+    Fetch the last n_days of DE-LU PV actual generation from SMARD.
+    Returns an hourly MW Series (Europe/Berlin) or None on failure.
+    Used to populate lag_1d_pv / lag_7d_pv / lag_1d_pv_peak at inference time.
+    """
+    _MODULE = 125
+    _REGION = "DE-LU"
+    index_url = (
+        f"https://www.smard.de/app/chart_data/{_MODULE}/{_REGION}"
+        f"/index_quarterhour.json"
+    )
+    try:
+        resp = requests.get(index_url, timeout=30)
+        resp.raise_for_status()
+        all_ts = resp.json().get("timestamps", [])
+    except Exception as exc:
+        print(f"[custom_model_3] SMARD index fetch failed: {exc}")
+        return None
+
+    cutoff_ms = int(
+        (pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=n_days)).timestamp() * 1000
+    )
+    relevant = sorted(ts for ts in all_ts if ts >= cutoff_ms)
+
+    records: list[tuple] = []
+    for ts_ms in relevant:
+        chunk_url = (
+            f"https://www.smard.de/app/chart_data/{_MODULE}/{_REGION}/"
+            f"{_MODULE}_{_REGION}_quarterhour_{ts_ms}.json"
+        )
+        try:
+            r = requests.get(chunk_url, timeout=30)
+            r.raise_for_status()
+            for row in r.json().get("series", []):
+                if row and row[1] is not None:
+                    records.append((
+                        pd.Timestamp(row[0], unit="ms", tz="UTC"),
+                        float(row[1]) * 4.0,   # MWh / 15-min → MW
+                    ))
+        except Exception as exc:
+            print(f"[custom_model_3] SMARD chunk {ts_ms} failed: {exc}")
+        time.sleep(0.1)
+
+    if not records:
+        return None
+
+    idx, vals = zip(*records)
+    s = (
+        pd.Series(list(vals), index=pd.DatetimeIndex(list(idx)))
+        .sort_index()
+        .groupby(level=0).mean()
+        .tz_convert("Europe/Berlin")
+    )
+    return s.resample("h").mean()
+
+
+# ---------------------------------------------------------------------------
 # Model + cluster loading
 # ---------------------------------------------------------------------------
 
@@ -316,6 +377,7 @@ def _build_feature_df(
     target_date: date,
     locations: list[dict],
     p_physics: np.ndarray | None = None,   # aligned with extended_index
+    pv_series: pd.Series | None = None,    # recent SMARD MW for lag PV features
 ) -> pd.DataFrame:
     """
     Build feature matrix on extended_index (past 9 days + tomorrow),
@@ -376,6 +438,21 @@ def _build_feature_df(
     # --- Physics-based PV baseline (Yu et al. 2026 PhysEmbedFormer decomposition) ---
     if p_physics is not None:
         feat["p_physics"] = p_physics
+
+    # --- Lagged actual PV output (mirrors training features lag_1d_pv etc.) ---
+    if pv_series is not None:
+        pv_r = (
+            pv_series
+            .reindex(extended_index, method="nearest", tolerance=pd.Timedelta("90min"))
+            .fillna(0.0)
+        )
+        feat["lag_1d_pv"]  = pv_r.shift(24).fillna(0.0).values
+        feat["lag_7d_pv"]  = pv_r.shift(168).fillna(0.0).values
+        daily_peak = pv_series.groupby(pv_series.index.date).max()
+        feat["lag_1d_pv_peak"] = np.array([
+            float(daily_peak.get((ts - pd.Timedelta(days=1)).date(), 0.0))
+            for ts in extended_index
+        ])
 
     feat = feat.fillna(0.0)
 
@@ -450,7 +527,8 @@ def transform_payload(
         return payload
 
     # ------------------------------------------------------------------
-    # Step 3: Compute P_physics baseline, then build feature matrix.
+    # Step 3: Compute P_physics baseline, fetch recent SMARD PV for lag
+    # features, then build feature matrix.
     # Yu et al. 2026: P_ac = P_physics + P_residual (PhysEmbedFormer).
     # P_physics is added as a feature so LightGBM predicts the residual.
     # ------------------------------------------------------------------
@@ -474,10 +552,27 @@ def transform_payload(
         except Exception as exc:
             print(f"[custom_model_3] Physics computation failed: {exc}. Using zeros.")
 
+    # Fetch recent SMARD PV only when the trained model includes lag PV features.
+    pv_series_recent: pd.Series | None = None
+    if "lag_1d_pv" in _FEATURE_NAMES:
+        try:
+            pv_series_recent = _fetch_recent_smard_pv(n_days=9)
+            if pv_series_recent is None:
+                print(
+                    f"[custom_model_3] SMARD fetch returned None; "
+                    "lag_1d_pv / lag_7d_pv set to 0."
+                )
+        except Exception as exc:
+            print(
+                f"[custom_model_3] SMARD fetch failed: {exc}; "
+                "lag PV features set to 0."
+            )
+
     try:
         X_day_df = _build_feature_df(
             weather_dfs, extended_index, target_date, _CLUSTERS,
             p_physics=p_physics_ext,
+            pv_series=pv_series_recent,
         )
     except Exception as exc:
         print(f"[custom_model_3] Feature engineering failed: {exc}. Using baseline.")
@@ -508,6 +603,17 @@ def transform_payload(
         print(f"[custom_model_3] Model prediction failed: {exc}. Using baseline.")
         return payload
 
+    # Scale diagnostic: raw LightGBM output vs expected SMARD range 0–60000 MW DE_LU
+    _pos = pred_residual[pred_residual > 0]
+    _pos_mean = f"{_pos.mean():.1f}" if len(_pos) else "0.0"
+    print(
+        f"[custom_model_3] SCALE CHECK {target_date}: "
+        f"raw_residual min={pred_residual.min():.1f}  max={pred_residual.max():.1f}  "
+        f"daytime_mean={_pos_mean} MW  "
+        f"cap_ref={_CAP_REF_GW:.2f} GW  "
+        f"[expected SMARD DE_LU solar: 0–60000 MW peak]"
+    )
+
     # Physics + residual reconstruction (Yu et al. 2026 PhysEmbedFormer)
     if _PHYSICS_DECOMP and physics_ok:
         day_mask      = extended_index.date == target_date
@@ -516,8 +622,21 @@ def transform_payload(
             pred_point = np.maximum(p_physics_day + pred_residual, 0.0)
         else:
             pred_point = np.maximum(pred_residual, 0.0)
+        print(
+            f"[custom_model_3] SCALE CHECK {target_date}: "
+            f"p_physics max={p_physics_day.max():.5f}  "
+            f"(negligible vs MW scale; residual dominates)"
+        )
     else:
         pred_point = np.maximum(pred_residual, 0.0)
+
+    _pp_pos = pred_point[pred_point > 0]
+    _pp_mean = f"{float(_pp_pos.mean()):.1f}" if len(_pp_pos) else "0.0"
+    print(
+        f"[custom_model_3] SCALE CHECK {target_date}: "
+        f"pred_point max={pred_point.max():.1f}  mean(>0)={_pp_mean} MW  "
+        f"[SMARD typical summer peak 30000–55000 MW]"
+    )
 
     # Derive per-hour std from Q10/Q90 spread (Gaussian: Q90-Q10 ≈ 3.29σ)
     std_per_hour = np.maximum((pred_q90 - pred_q10) / 3.29, 0.0)
@@ -569,6 +688,7 @@ def transform_payload(
             X_m_df    = _build_feature_df(
                 m_weather, ens_index, target_date, _CLUSTERS,
                 p_physics=p_phys_m_ext,
+                pv_series=pv_series_recent,
             )
             X_m        = X_m_df[_FEATURE_NAMES].values
             residual_m = _MODEL_POINT.predict(X_m)

@@ -418,8 +418,9 @@ def cluster_plants(df: pd.DataFrame, n_clusters: int = N_CLUSTERS) -> list[dict]
 # Open-Meteo archive (ERA5-Land reanalysis)
 # ---------------------------------------------------------------------------
 
-def fetch_open_meteo_archive(
-    lat: float,
+def fetch_open_meteo_archive(chrome://settings/search 
+
+    la  t: float,
     lon: float,
     start: date,
     end: date,
@@ -467,6 +468,93 @@ def fetch_open_meteo_archive(
         },
         index=pd.to_datetime(h["time"]),
     )
+    df.index = df.index.tz_localize(
+        "Europe/Berlin", ambiguous="NaT", nonexistent="shift_forward"
+    )
+    df = df[df.index.notna()]
+    df["temp"]  = df["temp"].ffill().fillna(10.0)
+    df["cloud"] = df["cloud"].ffill().fillna(50.0)
+    df["wind"]  = df["wind"].ffill().fillna(3.0)
+    return df.sort_index()
+
+
+# ---------------------------------------------------------------------------
+# Open-Meteo historical NWP forecast (matches inference data source)
+# Terren-Serrano et al. 2026: training-inference consistency
+# ---------------------------------------------------------------------------
+
+def fetch_open_meteo_forecast_historical(
+    lat: float,
+    lon: float,
+    start: date,
+    end: date,
+    *,
+    retries: int = 3,
+    chunk_days: int = 180,
+) -> pd.DataFrame:
+    """
+    Hourly NWP forecast data from the Open-Meteo historical forecast API.
+
+    Uses the same forecast model that custom_model_3.py queries at inference time,
+    eliminating the ERA5-vs-NWP distribution mismatch described in
+    Terren-Serrano et al. 2026 (reanalysis dataset A vs forecast dataset F).
+    Requests are split into chunk_days-day windows to keep payloads manageable.
+    """
+    url = "https://historical-forecast-api.open-meteo.com/v1/forecast"
+
+    def _c(vals: list, fb: float = 0.0) -> list:
+        return [v if v is not None else fb for v in vals]
+
+    # Split full range into fixed-size chunks
+    chunks: list[tuple[date, date]] = []
+    cur = start
+    while cur <= end:
+        chunk_end = min(cur + timedelta(days=chunk_days - 1), end)
+        chunks.append((cur, chunk_end))
+        cur = chunk_end + timedelta(days=1)
+
+    dfs: list[pd.DataFrame] = []
+    for chunk_idx, (chunk_s, chunk_e) in enumerate(chunks):
+        params = {
+            "latitude":   lat,
+            "longitude":  lon,
+            "start_date": chunk_s.isoformat(),
+            "end_date":   chunk_e.isoformat(),
+            "hourly":     "shortwave_radiation,temperature_2m,cloudcover,precipitation,windspeed_10m,diffuse_radiation",
+            "timezone":   "Europe/Berlin",
+        }
+        for attempt in range(retries):
+            try:
+                resp = requests.get(url, params=params, timeout=120)
+                resp.raise_for_status()
+                break
+            except Exception as exc:
+                if attempt == retries - 1:
+                    raise RuntimeError(
+                        f"Open-Meteo NWP historical failed ({lat},{lon}) "
+                        f"{chunk_s}–{chunk_e}: {exc}"
+                    ) from exc
+                wait = 10 * (attempt + 1)
+                print(f"  [NWP-hist] Retry {attempt+1}/{retries} in {wait}s: {exc}")
+                time.sleep(wait)
+
+        h = resp.json()["hourly"]
+        dfs.append(pd.DataFrame(
+            {
+                "ghi":    _c(h["shortwave_radiation"]),
+                "temp":   _c(h["temperature_2m"],    fb=float("nan")),
+                "cloud":  _c(h["cloudcover"],         fb=float("nan")),
+                "precip": _c(h["precipitation"]),
+                "wind":   _c(h["windspeed_10m"],      fb=float("nan")),
+                "dhi":    _c(h["diffuse_radiation"]),
+            },
+            index=pd.to_datetime(h["time"]),
+        ))
+        if len(chunks) > 1 and chunk_idx < len(chunks) - 1:
+            time.sleep(0.5)
+
+    df = pd.concat(dfs)
+    df = df[~df.index.duplicated(keep="first")]
     df.index = df.index.tz_localize(
         "Europe/Berlin", ambiguous="NaT", nonexistent="shift_forward"
     )
@@ -613,6 +701,7 @@ def build_feature_df(
     common_index: pd.DatetimeIndex,
     locations: list[dict],
     p_physics: np.ndarray | None = None,   # aligned with common_index
+    y_smard: pd.Series | None = None,      # normalized SMARD MW, for lag PV features
 ) -> pd.DataFrame:
     """
     Build the complete hourly feature matrix.
@@ -684,6 +773,17 @@ def build_feature_df(
     if p_physics is not None:
         feat["p_physics"] = p_physics
 
+    # --- Lagged actual PV output (reduces post-event uncertainty) ---
+    if y_smard is not None:
+        pv_s = y_smard.reindex(common_index).ffill().fillna(0.0)
+        feat["lag_1d_pv"]  = pv_s.shift(24).values
+        feat["lag_7d_pv"]  = pv_s.shift(168).values
+        daily_peak = pv_s.groupby(pv_s.index.date).max()
+        feat["lag_1d_pv_peak"] = np.array([
+            float(daily_peak.get((ts - pd.Timedelta(days=1)).date(), 0.0))
+            for ts in common_index
+        ])
+
     return feat.fillna(0.0)
 
 
@@ -694,9 +794,9 @@ def build_feature_df(
 def _lgbm_params(objective: str, alpha: float | None = None) -> dict:
     p: dict = dict(
         objective=objective,
-        n_estimators=800,
+        n_estimators=1200,
         learning_rate=0.04,
-        num_leaves=63,
+        num_leaves=127,
         min_child_samples=20,
         subsample=0.8,
         colsample_bytree=0.8,
@@ -752,18 +852,89 @@ def main() -> None:
     print(f"[✓] Saved clusters.json  ({len(clusters)} clusters)")
 
     # ------------------------------------------------------------------
-    # 3. Fetch Open-Meteo archive for each cluster centroid
+    # 3. Fetch NWP forecast historical data for each cluster centroid.
+    # Terren-Serrano et al. 2026: aligning training and inference to the
+    # same NWP forecast data source eliminates reanalysis-vs-forecast bias.
+    # ERA5 reanalysis is fetched in parallel for distribution comparison only.
+    # Cache paths:
+    #   weather_cache_nwp_k{i}.parquet  – primary training data (NWP)
+    #   weather_cache_era5_k{i}.parquet – ERA5 reanalysis (comparison only)
     # ------------------------------------------------------------------
+    print(
+        "[NWP] Using NWP forecast data for training "
+        "(Terren-Serrano et al. 2026: training-inference consistency)"
+    )
     weather_dfs: dict[str, pd.DataFrame] = {}
-    for c in clusters:
-        print(f"[Open-Meteo] {c['name']}  lat={c['lat']}, lon={c['lon']} …")
-        weather_dfs[c["name"]] = fetch_open_meteo_archive(
-            c["lat"], c["lon"], TRAIN_START, TRAIN_END
+    era5_dfs:    dict[str, pd.DataFrame] = {}   # for distribution comparison only
+
+    for i, c in enumerate(clusters):
+        nwp_cache  = ARTIFACT_DIR / f"weather_cache_nwp_k{i}.parquet"
+        era5_cache = ARTIFACT_DIR / f"weather_cache_era5_k{i}.parquet"
+
+        # --- Primary: NWP forecast historical ---
+        if nwp_cache.exists():
+            print(f"[NWP]  {c['name']}: loading from cache {nwp_cache.name}")
+            weather_dfs[c["name"]] = pd.read_parquet(nwp_cache)
+        else:
+            try:
+                print(f"[NWP]  {c['name']}  lat={c['lat']}, lon={c['lon']} …")
+                df_nwp = fetch_open_meteo_forecast_historical(
+                    c["lat"], c["lon"], TRAIN_START, TRAIN_END
+                )
+                df_nwp.to_parquet(nwp_cache)
+                print(f"  Saved NWP cache: {nwp_cache.name}  ({len(df_nwp):,} h)")
+                weather_dfs[c["name"]] = df_nwp
+            except Exception as exc:
+                print(
+                    f"  [!] NWP historical fetch failed for {c['name']}: {exc}. "
+                    "Falling back to ERA5 reanalysis."
+                )
+                df_era5 = fetch_open_meteo_archive(c["lat"], c["lon"], TRAIN_START, TRAIN_END)
+                df_era5.to_parquet(era5_cache)   # cache for future comparison too
+                weather_dfs[c["name"]] = df_era5
+            time.sleep(1.5)
+
+        # --- Also fetch ERA5 for distribution comparison (cached) ---
+        if era5_cache.exists():
+            era5_dfs[c["name"]] = pd.read_parquet(era5_cache)
+        else:
+            try:
+                print(f"[ERA5] {c['name']}  lat={c['lat']}, lon={c['lon']} (comparison) …")
+                df_era5 = fetch_open_meteo_archive(c["lat"], c["lon"], TRAIN_START, TRAIN_END)
+                df_era5.to_parquet(era5_cache)
+                era5_dfs[c["name"]] = df_era5
+                time.sleep(1.5)
+            except Exception as exc:
+                print(f"  [!] ERA5 comparison fetch failed for {c['name']}: {exc}. Skipping.")
+
+    # --- Distribution comparison: ERA5 vs NWP ---
+    if era5_dfs:
+        print(
+            "\n[Distribution] ERA5 reanalysis vs NWP forecast  "
+            "(Terren-Serrano et al. 2026: dataset shift A→F):"
         )
-        time.sleep(1.5)
+        print(f"  {'Cluster':12s}  {'ERA5 GHI':>10s}  {'NWP GHI':>10s}  {'Bias %':>7s}  {'Corr r':>8s}")
+        for c in clusters:
+            name = c["name"]
+            if name not in era5_dfs or name not in weather_dfs:
+                continue
+            common = era5_dfs[name].index.intersection(weather_dfs[name].index)
+            if len(common) < 100:
+                continue
+            ghi_era5 = era5_dfs[name].loc[common, "ghi"].values
+            ghi_nwp  = weather_dfs[name].loc[common, "ghi"].values
+            mean_era5 = float(ghi_era5.mean())
+            mean_nwp  = float(ghi_nwp.mean())
+            bias_pct  = (mean_nwp - mean_era5) / max(mean_era5, 0.1) * 100.0
+            corr      = float(np.corrcoef(ghi_era5, ghi_nwp)[0, 1])
+            print(
+                f"  {name:12s}  {mean_era5:10.2f}  {mean_nwp:10.2f}  "
+                f"{bias_pct:+7.1f}%  {corr:8.4f}"
+            )
+        print()
 
     # ------------------------------------------------------------------
-    # 4. Compute P_physics baseline, then build feature matrix.
+    # 4. Compute P_physics baseline.
     # Yu et al. 2026: P_ac = P_physics + P_residual (PhysEmbedFormer, eq. 6).
     # ------------------------------------------------------------------
     common_index = weather_dfs[clusters[0]["name"]].index
@@ -781,14 +952,10 @@ def main() -> None:
         f"nonzero={int((p_physics_full > 0).sum()):,} h"
     )
 
-    print(f"Building feature matrix ({len(common_index):,} hourly steps) …")
-    X_df          = build_feature_df(weather_dfs, common_index, clusters, p_physics=p_physics_full)
-    feature_names = list(X_df.columns)
-    X             = X_df.values
-    print(f"  Shape: {X.shape[0]:,} × {X.shape[1]} features")
-
     # ------------------------------------------------------------------
-    # 5. Fetch SMARD PV target
+    # 5. Fetch and normalize SMARD PV target.
+    # Moved before feature matrix (step 6) so that lagged actual PV output
+    # (lag_1d_pv, lag_7d_pv, lag_1d_pv_peak) can be included as features.
     # ------------------------------------------------------------------
     print("Fetching SMARD PV actual generation …")
     target_series = fetch_smard_pv_series(TRAIN_START, TRAIN_END)
@@ -798,22 +965,12 @@ def main() -> None:
         print(f"[✓] SMARD: {len(target_series):,} hourly values")
         y = target_series.reindex(common_index).ffill().fillna(0.0).values
     else:
-        print("[!] SMARD unavailable – using synthetic target (GHI × 0.15 + noise)")
-        rng = np.random.default_rng(42)
-        y   = np.maximum(
-            X_df["w_ghi"].values * 0.15
-            + rng.normal(0, X_df["w_ghi"].values * 0.03 + 0.5),
-            0.0,
-        )
+        print("[!] SMARD unavailable – lagged PV features and capacity normalization skipped.")
+        y = None
 
-    # ------------------------------------------------------------------
     # Step 5b: Normalize SMARD target by installed capacity growth.
-    # Nespoli et al. 2019: scaling raw MW values to cap_ref-equivalent MW
-    # removes the non-stationarity from PV fleet growth during 2024-26.
-    # Formula: y_norm = y_smard * (cap_ref / cap_t)
-    # At inference time NO scaling is needed — the model already predicts
-    # in cap_ref (current-capacity) MW units.
-    # ------------------------------------------------------------------
+    # Nespoli et al. 2019: y_norm = y_smard * (cap_ref / cap_t)
+    # At inference time NO scaling is needed (cap_t ≈ cap_ref at current date).
     if smard_ok and capacity_ok:
         month_keys = [ts.strftime("%Y-%m") for ts in common_index]
         cap_t      = np.array([capacity_timeline.get(mk, cap_ref_gw) for mk in month_keys])
@@ -823,6 +980,29 @@ def main() -> None:
             f"[Capacity] SMARD target normalized to cap_ref={cap_ref_gw:.2f} GW equivalent"
         )
 
+    # ------------------------------------------------------------------
+    # 6. Build feature matrix (lag PV features included when SMARD available).
+    # ------------------------------------------------------------------
+    y_smard_series = pd.Series(y, index=common_index) if smard_ok else None
+    print(f"Building feature matrix ({len(common_index):,} hourly steps) …")
+    X_df = build_feature_df(
+        weather_dfs, common_index, clusters,
+        p_physics=p_physics_full,
+        y_smard=y_smard_series,
+    )
+    feature_names = list(X_df.columns)
+    X             = X_df.values
+    print(f"  Shape: {X.shape[0]:,} × {X.shape[1]} features")
+
+    # Fill synthetic target once w_ghi is available (SMARD fallback only)
+    if not smard_ok:
+        rng = np.random.default_rng(42)
+        y   = np.maximum(
+            X_df["w_ghi"].values * 0.15
+            + rng.normal(0, X_df["w_ghi"].values * 0.03 + 0.5),
+            0.0,
+        )
+
     # Physics decomposition: LightGBM learns P_residual = P_actual - P_physics
     # Yu et al. 2026: PhysEmbedFormer – physics-guided target decomposition.
     y_residual = y - p_physics_full    # may be negative at night/overcast hours
@@ -830,9 +1010,9 @@ def main() -> None:
     # Drop rows where SMARD target is NaN or negative
     mask      = np.isfinite(y) & (y >= 0)
     X         = X[mask]
-    y_smard_m = y[mask]                # original SMARD values (for validation)
+    y_smard_m = y[mask]                # normalized SMARD values for validation
     y_train   = y_residual[mask]       # residual target for LightGBM
-    p_phys_m  = p_physics_full[mask]   # physics baseline (for validation)
+    p_phys_m  = p_physics_full[mask]   # physics baseline for validation
     idx_m     = common_index[mask]
     print(f"  Samples after NaN removal: {len(y_train):,}")
 
@@ -872,18 +1052,61 @@ def main() -> None:
     print(f"CV RMSE: {np.mean(rmse_folds):.2f} ± {np.std(rmse_folds):.2f} MW")
 
     # ------------------------------------------------------------------
-    # 8. Final models on all data
+    # 8. Final models – chronological 90/10 split for early stopping.
+    # Standard LightGBM best practice: hold out the last 10% chronologically
+    # as a validation set so early_stopping selects the tree count before
+    # the model overfits the training window.
     # ------------------------------------------------------------------
-    print("Fitting final models on all data …")
+    split_idx       = int(len(X) * 0.9)
+    X_tr,  X_val    = X[:split_idx],        X[split_idx:]
+    y_tr,  y_val    = y_train[:split_idx],  y_train[split_idx:]
+    sw_tr           = sample_weight[:split_idx]
+    print(
+        f"Fitting final models  "
+        f"(train={split_idx:,}  val={len(X)-split_idx:,} samples, early stopping) …"
+    )
+
     model_point = lgb.LGBMRegressor(**_lgbm_params("regression"))
-    model_point.fit(X, y_train, sample_weight=sample_weight, feature_name=feature_names)
+    model_point.fit(
+        X_tr, y_tr,
+        sample_weight=sw_tr,
+        eval_set=[(X_val, y_val)],
+        feature_name=feature_names,
+        callbacks=[
+            lgb.early_stopping(stopping_rounds=50, verbose=False),
+            lgb.log_evaluation(period=0),
+        ],
+    )
 
     model_q10 = lgb.LGBMRegressor(**_lgbm_params("quantile", alpha=0.10))
-    model_q10.fit(X, y_train, sample_weight=sample_weight, feature_name=feature_names)
+    model_q10.fit(
+        X_tr, y_tr,
+        sample_weight=sw_tr,
+        eval_set=[(X_val, y_val)],
+        feature_name=feature_names,
+        callbacks=[
+            lgb.early_stopping(stopping_rounds=50, verbose=False),
+            lgb.log_evaluation(period=0),
+        ],
+    )
 
     model_q90 = lgb.LGBMRegressor(**_lgbm_params("quantile", alpha=0.90))
-    model_q90.fit(X, y_train, sample_weight=sample_weight, feature_name=feature_names)
-    print("[✓] All three models trained.")
+    model_q90.fit(
+        X_tr, y_tr,
+        sample_weight=sw_tr,
+        eval_set=[(X_val, y_val)],
+        feature_name=feature_names,
+        callbacks=[
+            lgb.early_stopping(stopping_rounds=50, verbose=False),
+            lgb.log_evaluation(period=0),
+        ],
+    )
+    print(
+        f"[✓] All three models trained.  "
+        f"Early stopping: point={model_point.best_iteration_} trees, "
+        f"q10={model_q10.best_iteration_} trees, "
+        f"q90={model_q90.best_iteration_} trees"
+    )
 
     # Feature importances (top 15)
     imps    = model_point.feature_importances_
