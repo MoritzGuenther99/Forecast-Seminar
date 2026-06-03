@@ -79,5 +79,8 @@
   "lag_7d_ghi",
   "roll3d_ghi",
   "is_sunny",
-  "p_physics"
+  "p_physics",
+  "lag_1d_pv",
+  "lag_7d_pv",
+  "lag_1d_pv_peak"
 ]
