@@ -418,9 +418,8 @@ def cluster_plants(df: pd.DataFrame, n_clusters: int = N_CLUSTERS) -> list[dict]
 # Open-Meteo archive (ERA5-Land reanalysis)
 # ---------------------------------------------------------------------------
 
-def fetch_open_meteo_archive(chrome://settings/search 
-
-    la  t: float,
+def fetch_open_meteo_archive(
+    lat: float,
     lon: float,
     start: date,
     end: date,

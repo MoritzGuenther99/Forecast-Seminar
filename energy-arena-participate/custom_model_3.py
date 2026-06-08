@@ -606,11 +606,12 @@ def transform_payload(
     # Scale diagnostic: raw LightGBM output vs expected SMARD range 0–60000 MW DE_LU
     _pos = pred_residual[pred_residual > 0]
     _pos_mean = f"{_pos.mean():.1f}" if len(_pos) else "0.0"
+    _cap_ref_str = f"{_CAP_REF_GW:.2f}" if _CAP_REF_GW is not None else "n/a"
     print(
         f"[custom_model_3] SCALE CHECK {target_date}: "
         f"raw_residual min={pred_residual.min():.1f}  max={pred_residual.max():.1f}  "
         f"daytime_mean={_pos_mean} MW  "
-        f"cap_ref={_CAP_REF_GW:.2f} GW  "
+        f"cap_ref={_cap_ref_str} GW  "
         f"[expected SMARD DE_LU solar: 0–60000 MW peak]"
     )
 
@@ -619,16 +620,22 @@ def transform_payload(
         day_mask      = extended_index.date == target_date
         p_physics_day = p_physics_ext[day_mask]
         if len(p_physics_day) == len(pred_residual):
-            pred_point = np.maximum(p_physics_day + pred_residual, 0.0)
+            pred_point    = np.maximum(p_physics_day + pred_residual, 0.0)
+            pred_q10_full = np.maximum(p_physics_day + pred_q10,      0.0)
+            pred_q90_full = np.maximum(p_physics_day + pred_q90,      0.0)
         else:
-            pred_point = np.maximum(pred_residual, 0.0)
+            pred_point    = np.maximum(pred_residual, 0.0)
+            pred_q10_full = np.maximum(pred_q10,      0.0)
+            pred_q90_full = np.maximum(pred_q90,      0.0)
         print(
             f"[custom_model_3] SCALE CHECK {target_date}: "
             f"p_physics max={p_physics_day.max():.5f}  "
             f"(negligible vs MW scale; residual dominates)"
         )
     else:
-        pred_point = np.maximum(pred_residual, 0.0)
+        pred_point    = np.maximum(pred_residual, 0.0)
+        pred_q10_full = np.maximum(pred_q10,      0.0)
+        pred_q90_full = np.maximum(pred_q90,      0.0)
 
     _pp_pos = pred_point[pred_point > 0]
     _pp_mean = f"{float(_pp_pos.mean()):.1f}" if len(_pp_pos) else "0.0"
@@ -730,19 +737,16 @@ def transform_payload(
 
     mean_forecast = _resample_to_steps(mean_forecast_24, n_steps)
     std_per_step  = _resample_to_steps(std_per_hour,     n_steps)
+    pred_q10_ns   = _resample_to_steps(pred_q10_full,   n_steps)
+    pred_q90_ns   = _resample_to_steps(pred_q90_full,   n_steps)
 
     # ------------------------------------------------------------------
-    # Step 6b: Spread correction based on sunny/cloudy classification.
-    # Nespoli et al. 2019: daily mean GHI >= 150 W/m² → sunny day.
-    # Wider spread for cloudy days (higher uncertainty), tighter for sunny.
+    # Step 6b: Sunny/cloudy classification (for logging only).
+    # Ensemble members are kept at raw ECMWF spread (no artificial scaling).
+    # 5-quantile outputs use the trained LightGBM Q10/Q90 models directly.
     # ------------------------------------------------------------------
     daily_mean_wghi = float(X_day_df["w_ghi"].mean())
     is_sunny        = daily_mean_wghi >= _SUNNY_THRESHOLD
-    spread_factor   = 0.8 if is_sunny else 1.5
-    if ensemble_available and member_preds_ns is not None:
-        ensemble_mean   = member_preds_ns.mean(axis=0)
-        deviations      = member_preds_ns - ensemble_mean
-        member_preds_ns = np.maximum(ensemble_mean + deviations * spread_factor, 0.0)
 
     # ------------------------------------------------------------------
     # Step 7: Night-hour mask (applied to mean and all ensemble members)
@@ -761,7 +765,8 @@ def transform_payload(
         f"night_steps={int(night_mask.sum())}  "
         f"n_clusters={len(_CLUSTERS)}  "
         f"ensemble={'yes' if ensemble_available else 'no (fallback)'}  "
-        f"spread_factor={spread_factor:.2f} ({'sunny' if is_sunny else 'cloudy'})"
+        f"{'sunny' if is_sunny else 'cloudy'}  "
+        f"q10_peak={pred_q10_ns.max():.1f}  q90_peak={pred_q90_ns.max():.1f} MW"
     )
 
     # ------------------------------------------------------------------
@@ -776,31 +781,21 @@ def transform_payload(
             payload["values"][index] = fval
 
         elif isinstance(original_value, list) and len(original_value) == 5:
-            if ensemble_available and member_preds_ns is not None:
-                # Per-timestep empirical quantiles from 50 ECMWF members
-                # Sperati et al. 2016: empirical quantiles from ensemble spread
-                vals = member_preds_ns[:, index]
-                payload["values"][index] = [
-                    float(np.percentile(vals, 10)),
-                    float(np.percentile(vals, 25)),
-                    float(np.percentile(vals, 50)),
-                    float(np.percentile(vals, 75)),
-                    float(np.percentile(vals, 90)),
-                ]
-            else:
-                # Fallback: Gaussian spread derived from Q10/Q90 model
-                payload["values"][index] = [
-                    float(max(0.0, fval - 2.0 * std)),
-                    float(max(0.0, fval - 0.7 * std)),
-                    float(fval),
-                    float(fval + 0.7 * std),
-                    float(fval + 2.0 * std),
-                ]
+            # LightGBM Q10/Q90 models — better calibrated than ECMWF percentiles.
+            q10 = float(pred_q10_ns[index]) if index < len(pred_q10_ns) else 0.0
+            q90 = float(pred_q90_ns[index]) if index < len(pred_q90_ns) else fval
+            payload["values"][index] = [
+                float(max(0.0, q10 * 0.7)),
+                float(max(0.0, q10 + (fval - q10) * 0.5)),
+                float(max(0.0, fval)),
+                float(max(0.0, q90 - (q90 - fval) * 0.5)),
+                float(max(0.0, q90 * 1.3)),
+            ]
 
         elif isinstance(original_value, list) and len(original_value) == 100:
             if ensemble_available and member_preds_ns is not None:
-                # 50 ECMWF members → 100 via duplication with 2% jitter
-                # Terren-Serrano et al. 2026: ensemble resampling for 100-member format
+                # 50 ECMWF members at raw ensemble spread → 100 via duplication with 2% jitter.
+                # No artificial spread scaling: member_preds_ns is unmodified ECMWF output.
                 members_50 = member_preds_ns[:, index]
                 np.random.seed(index)
                 jitter      = np.random.normal(0, 0.02, 50)
